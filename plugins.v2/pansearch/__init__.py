@@ -317,6 +317,8 @@ class PanSearch(_PluginBase):
     _quark_media_path: str = "/"
     _guangya_media_path: str = "/"
     _cloud_media_path: str = "/"
+    _movie_media_path: str = "/"
+    _tv_media_path: str = "/"
     _organize_after_transfer: bool = False
     _strm_generate_enabled: bool = True
     _nfo_scrape_enabled: bool = False
@@ -1124,6 +1126,12 @@ class PanSearch(_PluginBase):
                 "tianyi": self._tianyi_media_path,
                 "alipan": self._alipan_media_path,
             }.get(self._cloud_drive_key, "/")
+            self._movie_media_path = self._config_cloud_path(
+                config.get("movie_media_path", "") or self._cloud_media_path
+            )
+            self._tv_media_path = self._config_cloud_path(
+                config.get("tv_media_path", "") or self._cloud_media_path
+            )
             self._organize_after_transfer = bool(
                 config.get("organize_after_transfer", False)
             )
@@ -1815,6 +1823,8 @@ class PanSearch(_PluginBase):
             chain=self.chain,
             cloud_transfer_path=self._cloud_transfer_path,
             cloud_media_root=self._cloud_media_path,
+            movie_media_root=self._movie_media_path,
+            tv_media_root=self._tv_media_path,
             organize_after_transfer=self._organize_after_transfer,
             cloud_transfer_paths={
                 "115": self._p115_transfer_path,

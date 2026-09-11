@@ -177,6 +177,8 @@ class SyncHandler:
     _SUBSCRIBE_CALENDAR_CACHE_TTL = 26 * 60 * 60
     _NOTIFICATION_BATCH_WINDOW_SECONDS = 2
     _CLOUD_MEDIA_ROOT = "/"
+    _MOVIE_MEDIA_ROOT = "/"
+    _TV_MEDIA_ROOT = "/"
     _OFFLINE_RESOURCE_URL_RE = re.compile(
         r"ed2k://\|file\|[^|\r\n]+\|\d+\|[0-9A-Fa-f]{32}"
         r"(?:\|(?:h|p)=[^|\r\n]+)*\|/|magnet:\?[^\s\r\n]+",
@@ -197,6 +199,8 @@ class SyncHandler:
             chain,
             cloud_transfer_path: str,
             cloud_media_root: str = "/",
+            movie_media_root: str = "/",
+            tv_media_root: str = "/",
             organize_after_transfer: bool = False,
             cloud_transfer_paths: Optional[Mapping[str, str]] = None,
             transfer_task_batch_size: int = 50,
@@ -250,6 +254,8 @@ class SyncHandler:
         :param chain: MediaChain 实例
         :param cloud_transfer_path: 当前网盘转存暂存路径
         :param cloud_media_root: 当前网盘媒体库分类根目录
+        :param movie_media_root: 电影媒体根目录；未配置时回退媒体库根目录
+        :param tv_media_root: 电视剧媒体根目录；未配置时回退媒体库根目录
         :param organize_after_transfer: 转存后是否继续整理进媒体库；关闭时文件停在中转目录即完成
         :param cloud_transfer_paths: 各网盘提供方的转存暂存路径
         :param transfer_task_batch_size: 同一任务内每批处理的最大文件数
@@ -386,6 +392,8 @@ class SyncHandler:
                 str(cloud_transfer_path or "/").strip().rstrip("/") or "/"
         )
         self._CLOUD_MEDIA_ROOT = self._normalize_cloud_path(cloud_media_root)
+        self._MOVIE_MEDIA_ROOT = self._normalize_cloud_path(movie_media_root)
+        self._TV_MEDIA_ROOT = self._normalize_cloud_path(tv_media_root)
         self._organize_after_transfer = bool(organize_after_transfer)
         self._cloud_transfer_paths = {
             str(key).strip().lower(): self._normalize_cloud_path(value)
@@ -3082,6 +3090,15 @@ class SyncHandler:
         except Exception as error:
             logger.error(f"文件后处理完成后更新订阅失败：{subscribe_id}，{error}")
 
+    def _select_media_root(self, root_path: str, mediainfo: MediaInfo) -> str:
+        """按媒体类型选择电影/电视剧媒体根目录；未配置时回退传入的媒体库根目录。"""
+        media_type_value = getattr(getattr(mediainfo, "type", None), "value", None)
+        if media_type_value == MediaType.MOVIE.value:
+            return self._MOVIE_MEDIA_ROOT or root_path or "/"
+        if media_type_value == MediaType.TV.value:
+            return self._TV_MEDIA_ROOT or root_path or "/"
+        return root_path or "/"
+
     def _platform_classified_root(
             self,
             root_path: str,
@@ -3113,14 +3130,11 @@ class SyncHandler:
         directory = DirectoryHelper().get_dir(media=mediainfo, include_unsorted=False)
         resolved = None
         if directory:
-            updates = {"library_path": root_path}
-            if hasattr(directory, "model_copy"):
-                target_directory = directory.model_copy(deep=True, update=updates)
-            else:
-                target_directory = directory.copy(deep=True, update=updates)
+            # 不再覆盖 MoviePilot 目录配置的 library_path：
+            # 类型层（电视剧/电影）由目录配置决定，插件只在未命中时按类型兜底。
             classified_root = TransHandler().get_dest_dir(
                 mediainfo=mediainfo,
-                target_dir=target_directory,
+                target_dir=directory,
             )
             if classified_root:
                 resolved = Path(classified_root)
@@ -3151,8 +3165,9 @@ class SyncHandler:
     ) -> Optional[Path]:
         """使用当前分类目录和重命名模板生成完整目标路径。"""
         effective_media = self._effective_mediainfo(subscribe, mediainfo)
+        media_root = self._select_media_root(root_path, effective_media)
         classified_root = self._platform_classified_root(
-            root_path, subscribe, effective_media
+            media_root, subscribe, effective_media
         )
         if not classified_root:
             return None

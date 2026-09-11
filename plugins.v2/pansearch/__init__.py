@@ -115,12 +115,15 @@ class PanSearch(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/odomu/MoviePilot-Plugins/main/icons/cloud.png"
     # 插件版本
-    # v1.5.4：终审定位失败根治——终审窗口与离线超时同源可配，判死前全盘
-    # 检索兜底（命中视同定位成功，未命中零进展 3 轮暂缓）；ED2K/magnet
-    # 提交成功不再落终态成功，统一登记 pending 走下载中；失败写入全链路
-    # 收口必带 failure_reason+WARNING 且成功优先消解矛盾记录；手动通道
-    # pending 统一 schema、过期必检，存量核对全盘兜底+假成功反查降级。
-    plugin_version = "1.5.4"
+    # v1.5.5：媒体库目录分类修复——新增电影/电视剧媒体目录配置
+    # （movie_media_path/tv_media_path，未设置回退媒体库目录兼容旧配置）；
+    # _platform_classified_root 不再用 cloud_media_path 覆盖 MoviePilot
+    # 目录配置 library_path（电视剧/电影类型层不再被抹掉，分类规则继续走
+    # MoviePilot 系统规则），修复电视剧错落 /影视库/国产剧/ 导致目录乱；
+    # 目录计算修正后存量处理中/下载中任务可自然推进终态；转存整理开关闭环
+    # 确认（关闭时文件停在中转目录即完成，不建分类/不生成 STRM）；前端配置页
+    # 新增电影/电视剧媒体目录字段并重建 dist。
+    plugin_version = "1.5.5"
     # 插件作者
     plugin_author = "odomu"
     # 作者主页

@@ -970,12 +970,48 @@ class SyncRuntimeService(OwnerDelegator):
                 except Exception as error:
                     logger.error(
                         f"媒体后处理队列执行失败："
-                        f"{len(group['pending_keys'])} 个文件，{error}"
+                        f"{len(group['pending_keys'])} 个文件，{error}",
+                        exc_info=True,
                     )
-                    continue
+                    result = self._retry_group_isolated(
+                        sync_handler, group, shared_kwargs
+                    )
                 for field in ("checked", "completed", "failed"):
                     totals[field] += int(result.get(field) or 0)
         totals["pending"] = len(sync_handler.get_pending_finalize_tasks())
+        return totals
+
+    def _retry_group_isolated(
+            self,
+            sync_handler: Any,
+            group: Dict[str, Any],
+            shared_kwargs: Dict[str, Any],
+    ) -> Dict[str, int]:
+        """整组执行失败后降级为逐条重试，隔离异常条目（v1.5.6 F2）。
+
+        批量执行时，单条损坏数据会让整组 pending 本轮全部不推进，且连败
+        计数不增长，表现为任务长期停留在"后处理中"。降级逐条执行后，健康
+        条目照常推进，异常条目单独记录并带上 pending_key，便于定位清理。
+        """
+        keys = list(group.get("pending_keys") or [])
+        totals = {"checked": 0, "completed": 0, "failed": 0}
+        if len(keys) < 2:
+            return totals
+        logger.warning(f"后处理队列降级为逐条重试：{len(keys)} 个文件")
+        for pending_key in keys:
+            try:
+                result = sync_handler.monitor_offline_strm_tasks(
+                    **{**shared_kwargs, "pending_keys": {pending_key}}
+                )
+            except Exception as error:
+                logger.error(
+                    f"后处理条目异常已隔离：{pending_key}，{error}",
+                    exc_info=True,
+                )
+                totals["failed"] += 1
+                continue
+            for field in ("checked", "completed", "failed"):
+                totals[field] += int(result.get(field) or 0)
         return totals
 
     def _run_offline_monitor(self, **kwargs: Any) -> Dict[str, Any]:

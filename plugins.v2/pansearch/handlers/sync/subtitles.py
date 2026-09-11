@@ -535,7 +535,7 @@ class SubtitleService(OwnerDelegator):
                 current_dir = (
                     final_dir if str(target_file.id) in final_ids else staging_dir
                 )
-                if target_file.name != target_name:
+                if self._cloud_entry_name(target_file) != target_name:
                     if not self._cloud_mutations.rename_file(
                             current_dir, target_file, target_name
                     ):

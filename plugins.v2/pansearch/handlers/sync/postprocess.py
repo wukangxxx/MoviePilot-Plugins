@@ -705,7 +705,7 @@ class PostprocessService(OwnerDelegator):
             item["upgrade_old_file_id"] = str(getattr(old_file, "id", "") or old_id)
 
         if not item.get("moved_at"):
-            if target_file.name != file_name:
+            if self._cloud_entry_name(target_file) != file_name:
                 if not self._cloud_mutations.rename_file(staging_dir, target_file, file_name):
                     if item.get("upgrade_old_backed_up") and old_file:
                         if self._cloud_mutations.rename_file(old_dir, old_file, old_name):
@@ -1501,8 +1501,30 @@ class PostprocessService(OwnerDelegator):
                         ),
                         None,
                     )
+                # 记录"文件曾在转存目录出现过"：转存后整理关闭时，文件可能
+                # 已被 MoviePilot 等外部流程接管移走，该标记用于区分
+                # "已转出"（判成功）与"从未落盘"（仍判失败）。v1.5.6 F1。
+                if target_file and not item.get("staging_seen_at"):
+                    item["staging_seen_at"] = now
                 if not target_file and not already_moved:
                     final_dir = str(item.get("cloud_dir") or "/").rstrip("/") or "/"
+                    if not self._organize_after_transfer and item.get(
+                            "staging_seen_at"
+                    ):
+                        # 转存后整理关闭：文件已从转存目录转出，由外部流程
+                        # 接管。不再等待文件出现在自己算出的媒体目录、不再
+                        # 做全盘兜底检索、不再生成 STRM，直接判终。v1.5.6 F1。
+                        logger.info(
+                            f"转存后整理已关闭，文件已由外部流程接管，"
+                            f"直接完成：{file_name}"
+                        )
+                        media, media_data = self._restore_pending_media_context(
+                            item, pending_key
+                        )
+                        finalize_after_metadata(
+                            item, pending_key, file_name, None, media, media_data
+                        )
+                        continue
                     if final_dir != staging_dir:
                         final_valid, final_index = directory_snapshot(final_dir)
                         if final_valid:
@@ -1617,7 +1639,7 @@ class PostprocessService(OwnerDelegator):
                     update_progress(
                         item, pending_key, "organize", "重命名并移动到媒体目录"
                     )
-                    if target_file.name != file_name:
+                    if self._cloud_entry_name(target_file) != file_name:
                         if not self._cloud_mutations.rename_file(
                                 staging_dir, target_file, file_name
                         ):
@@ -2061,7 +2083,7 @@ class PostprocessService(OwnerDelegator):
                     )
                 else:
                     moved = source_file
-                    if moved.name != target_name:
+                    if self._cloud_entry_name(moved) != target_name:
                         if not self._cloud_mutations.rename_file(
                                 source_dir, moved, target_name
                         ):

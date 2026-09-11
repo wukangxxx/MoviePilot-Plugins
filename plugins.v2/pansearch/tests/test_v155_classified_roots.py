@@ -282,6 +282,19 @@ class TestMediaRootSelection(unittest.TestCase):
         )
 
 
+    def test_local_resource_root_not_hijacked_tv(self):
+        # Regression lock (F3 Finding A): local root must pass through unchanged.
+        self.assertEqual(
+            self.stub._select_media_root("/app/media", _tv_mediainfo()),
+            "/app/media",
+        )
+
+    def test_local_resource_root_not_hijacked_movie(self):
+        self.assertEqual(
+            self.stub._select_media_root("/app/media", _movie_mediainfo()),
+            "/app/media",
+        )
+
 @unittest.skipUnless(HAS_SELECT_MEDIA_ROOT, "F1 _select_media_root not implemented yet")
 class TestRenamePathLevel(unittest.TestCase):
     """Acceptance-level: final cloud dir prefix via _platform_rename_path."""
@@ -338,3 +351,4 @@ class TestRenamePathLevel(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+

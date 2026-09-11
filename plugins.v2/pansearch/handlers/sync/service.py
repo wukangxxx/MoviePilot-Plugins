@@ -1833,6 +1833,9 @@ class SyncHandler:
             item.get("cloud_dir"),
             getattr(self, "_cloud_transfer_path", ""),
             getattr(self, "_CLOUD_MEDIA_ROOT", ""),
+            # 电影/电视剧媒体根目录可能配置在媒体库根之外，一并纳入兜底检索候选。
+            getattr(self, "_MOVIE_MEDIA_ROOT", ""),
+            getattr(self, "_TV_MEDIA_ROOT", ""),
             "/",
         )
         roots: List[str] = []
@@ -3091,7 +3094,15 @@ class SyncHandler:
             logger.error(f"文件后处理完成后更新订阅失败：{subscribe_id}，{error}")
 
     def _select_media_root(self, root_path: str, mediainfo: MediaInfo) -> str:
-        """按媒体类型选择电影/电视剧媒体根目录；未配置时回退传入的媒体库根目录。"""
+        """按媒体类型选择电影/电视剧媒体根目录；未配置时回退传入的媒体库根目录。
+
+        仅当调用方传入的根目录是云盘媒体库根（_CLOUD_MEDIA_ROOT）时才应用
+        电影/电视剧目录覆盖；本地资源根等其它根目录原样返回，避免劫持
+        本地通知/STRM 的路径解析。
+        """
+        # 本地资源根等其他根目录不参与电影/电视剧目录覆盖。
+        if str(root_path or "/") != self._CLOUD_MEDIA_ROOT:
+            return root_path or "/"
         media_type_value = getattr(getattr(mediainfo, "type", None), "value", None)
         if media_type_value == MediaType.MOVIE.value:
             return self._MOVIE_MEDIA_ROOT or root_path or "/"

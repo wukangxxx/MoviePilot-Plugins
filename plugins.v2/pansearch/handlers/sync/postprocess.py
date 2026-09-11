@@ -1533,6 +1533,25 @@ class PostprocessService(OwnerDelegator):
                                     f"后处理在最终目录找到已移动文件，继续生成STRM："
                                     f"{final_dir}/{file_name}"
                                 )
+                    if not target_file:
+                        # 旧任务载荷里的 cloud_dir 可能仍是 F1 修复前的错误目录：
+                        # 按 F1 规则重算期望目录并二次定位，命中即本轮直接收敛，
+                        # 不再等 120 分钟终审窗口的全盘兜底。
+                        recomputed_dir = self._recompute_expected_cloud_dir(item, file_name)
+                        if (recomputed_dir and recomputed_dir != final_dir
+                                and recomputed_dir != staging_dir):
+                            recomputed_valid, recomputed_index = directory_snapshot(recomputed_dir)
+                            if recomputed_valid:
+                                recomputed_candidate = recomputed_index.get(file_name)
+                                if recomputed_candidate:
+                                    target_file = recomputed_candidate
+                                    item["moved_at"] = now
+                                    already_moved = True
+                                    staging_dir = recomputed_dir
+                                    logger.info(
+                                        f"载荷目录已过期，按F1规则重算目录命中文件，"
+                                        f"本轮直接收尾：{recomputed_dir}/{file_name}"
+                                    )
                 if not target_file:
                     ready_at = float(item.get("download_completed_at") or created_at)
                     if now - ready_at < self._FILE_FINALIZE_TIMEOUT:
@@ -1829,6 +1848,41 @@ class PostprocessService(OwnerDelegator):
         self._notify_offline_pending_changed(result["pending"])
         return result
 
+    def _recompute_expected_cloud_dir(
+            self, item: Dict[str, Any], file_name: str
+    ) -> Optional[str]:
+        """按 F1 目录规则重算旧任务期望的最终目录。
+
+        旧任务创建于 F1 修复前，载荷里的 cloud_dir 是错误目录；此方法用当前
+        规则重算期望目录，仅作为收尾定位的二次兜底，不影响主定位逻辑。
+        任何异常都按“无法重算”处理，返回 None。
+        """
+        try:
+            media_data = item.get("mediainfo") or {}
+            if not media_data:
+                return None
+            mediainfo = self._deserialize_mediainfo(media_data)
+            if mediainfo is None:
+                return None
+            subscribe = SimpleNamespace(
+                name=mediainfo.title or "",
+                year=mediainfo.year,
+                media_category=getattr(mediainfo, "category", None),
+            )
+            season = (
+                max(1, int(item.get("season") or 1))
+                if item.get("season") else None
+            )
+            episode = item.get("episode")
+            cloud_dir, _ = self._platform_target(
+                self._CLOUD_MEDIA_ROOT, subscribe, mediainfo, file_name,
+                season=season, episode=episode,
+            )
+            return str(cloud_dir or "").rstrip("/") or "/"
+        except Exception as error:
+            logger.debug(f"按F1规则重算期望目录失败，跳过二次定位：{error}")
+            return None
+
     def _finalize_magnet_package(
             self,
             item: Dict[str, Any],
@@ -2026,7 +2080,10 @@ class PostprocessService(OwnerDelegator):
                     episode=episode,
                 )
             strm_path = None
-            if self._strm_generate_enabled and self._strm_generator and self._local_resource_path:
+            # 整理开关关闭时文件停留在中转目录，由 MoviePilot 自行整理，
+            # 此处不得生成 STRM（闭环：关闭=不整理、不 STRM）。
+            if (self._strm_generate_enabled and self._strm_generator
+                    and self._local_resource_path and self._organize_after_transfer):
                 strm_path = self._generate_strm(
                     cloud_dir, target_name, target_file=moved, lookup_target=False
                 )

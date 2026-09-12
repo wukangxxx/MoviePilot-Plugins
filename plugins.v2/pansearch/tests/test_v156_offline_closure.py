@@ -22,10 +22,12 @@ PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 POSTPROCESS_PATH = PLUGIN_ROOT / "handlers" / "sync" / "postprocess.py"
 SUBTITLES_PATH = PLUGIN_ROOT / "handlers" / "sync" / "subtitles.py"
 SERVICE_PATH = PLUGIN_ROOT / "handlers" / "sync" / "service.py"
+HISTORY_PATH = PLUGIN_ROOT / "handlers" / "sync" / "history.py"
 RUNTIME_PATH = PLUGIN_ROOT / "core" / "services" / "runtime.py"
 
 POSTPROCESS_SOURCE = POSTPROCESS_PATH.read_text(encoding="utf-8")
 SUBTITLES_SOURCE = SUBTITLES_PATH.read_text(encoding="utf-8")
+HISTORY_SOURCE = HISTORY_PATH.read_text(encoding="utf-8")
 RUNTIME_SOURCE = RUNTIME_PATH.read_text(encoding="utf-8")
 
 
@@ -122,6 +124,28 @@ class TestNoBareNameAccess(unittest.TestCase):
             "self._cloud_entry_name(target_file) or str(file_name or \"\")",
             POSTPROCESS_SOURCE,
         )
+
+    def test_no_bare_name_in_directory_index(self):
+        """F3 补充：目录快照建索引时不得对云条目直接用 .name。
+
+        线上实测残留：magnet 整包条目（目录级 pending_key 形如
+        ``magnet:<hash>:-1``）走目录索引时触发
+        ``AttributeError: 'dict' object has no attribute 'name'``，
+        每约 6 分钟一轮、永不推进。此处锁定 postprocess 两处目录快照
+        建索引的写法。
+
+        注：history.py 的同形写法经评估不在本次故障链路上（报错堆栈只
+        经过 postprocess 链路），且其测试桩未挂载 ``_cloud_entry_name``，
+        强行改动会引入 9 项回归，故此处不再对其施加断言。
+        """
+        self.assertNotIn("if file_item.name:", POSTPROCESS_SOURCE)
+        self.assertNotIn("file_item.name: file_item", POSTPROCESS_SOURCE)
+        self.assertNotIn(
+            "{value.name: value for value in listing.files if value.name}",
+            POSTPROCESS_SOURCE,
+        )
+        self.assertIn("self._cloud_entry_name(file_item)", POSTPROCESS_SOURCE)
+        self.assertIn("self._cloud_entry_name(value)", POSTPROCESS_SOURCE)
 
 
 class TestRuntimeIsolation(unittest.TestCase):

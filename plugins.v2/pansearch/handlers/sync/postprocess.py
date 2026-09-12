@@ -936,8 +936,9 @@ class PostprocessService(OwnerDelegator):
                     else:
                         file_index = {}
                         for file_item in listing.files:
-                            if file_item.name:
-                                file_index[file_item.name] = file_item
+                            entry_name = self._cloud_entry_name(file_item)
+                            if entry_name:
+                                file_index[entry_name] = file_item
                         result = (True, file_index)
                 directory_snapshots[normalized_dir] = result
                 return result
@@ -1959,7 +1960,12 @@ class PostprocessService(OwnerDelegator):
             listing = self._cloud_directories.list_directory(lookup.directory_id)
             if not listing.checked:
                 return False, {}
-            return True, {value.name: value for value in listing.files if value.name}
+            index: Dict[str, Any] = {}
+            for value in listing.files:
+                entry_name = self._cloud_entry_name(value)
+                if entry_name:
+                    index[entry_name] = value
+            return True, index
 
         matched: List[Tuple[Optional[int], Any, int]] = []
         season = item.get("season")

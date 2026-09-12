@@ -332,7 +332,38 @@ class TestExpiredTaskEarlySweep(unittest.TestCase):
         snippet = self._snippet()
         self.assertIn("pending.pop(key, None)", snippet)
         self.assertIn("self._save_offline_pending(pending)", snippet)
-        self.assertIn("self._mark_offline_history_status(key, \"失败\", reason)", snippet)
+        # v1.5.14：超期任务的历史状态写入改为批量接口（定向 UPDATE），
+        # 不再逐条调用 _mark_offline_history_status。
+        self.assertIn("self._mark_offline_history_status_batch(", snippet)
+
+    def test_sweep_history_write_outside_lock(self):
+        """v1.5.14：超期任务的历史落库必须在 _offline_pending_lock 之外。
+
+        历史故障（2026-09-12 实测）：``_mark_offline_history_status`` 在
+        ``_offline_pending_lock`` 锁内被调用，而它会全量读历史表并用
+        ``replace_all`` 整体重写。历史行一多（165+ 条）就把监控器、
+        前端刷新 API、后续调度 tick 全部堵在这把锁上，表现为「后处理
+        长期卡住 + 页面很慢」——而 py-spy 抓到的栈顶正是
+        ``get_pending_finalize_tasks`` 在等这把锁。
+        """
+        snippet = self._snippet()
+        marker = "# ---- 以下全部在 _offline_pending_lock 之外 ----"
+        self.assertIn(marker, snippet)
+        i_unlock = snippet.index(marker)
+        i_mark = snippet.index("self._mark_offline_history_status_batch(")
+        self.assertLess(i_unlock, i_mark, "历史状态写入必须位于锁外")
+
+        locked = snippet[:i_unlock]
+        self.assertNotIn("self._mark_offline_history_status(", locked)
+        self.assertNotIn("self._mark_offline_history_status_batch(", locked)
+        for heavy in (
+            '_get_data("history")',
+            "_get_data('history')",
+            '_save_data("history")',
+            "_save_data('history')",
+            "_record_platform_transfer_histories(",
+        ):
+            self.assertNotIn(heavy, locked, "%s 不得出现在锁内" % heavy)
 
     def test_expired_count_carried_into_result(self):
         """提前返回与主流程返回都必须带上超期计数。"""

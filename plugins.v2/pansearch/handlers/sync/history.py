@@ -1909,7 +1909,15 @@ class HistoryService(OwnerDelegator):
     def _mark_offline_history_status_batch(
             self, pending_keys: Set[str], status: str, reason: str = ""
     ) -> None:
-        """一次扫描并持久化多个离线任务对应的历史记录。"""
+        """按 pending_key / share_url 更新对应历史记录的状态。
+
+        v1.5.14：新增**定向 UPDATE 快路径**。历史实现是
+        ``_get_data("history")`` + ``_save_data("history", ...)`` —— 一次状态
+        变更要拉出全部历史行、逐字段深比较、再整体写回；而本方法由后处理监控
+        在 ``_offline_pending_lock`` **锁内**调用，历史行数一多就把监控器、
+        前端刷新 API、后续调度 tick 全部堵在锁上，表现为「后处理长期卡住
+        + 页面很慢」。数据层支持定向更新时走快路径，否则回退原语义。
+        """
         if not self._get_data or not self._save_data:
             return
         normalized_keys = {
@@ -1918,6 +1926,32 @@ class HistoryService(OwnerDelegator):
         }
         if not normalized_keys:
             return
+
+        # 快路径：数据层支持定向更新时，只 UPDATE 命中行（O(命中行数)）。
+        store = None
+        getter = getattr(self, "_get_data_store", None)
+        if callable(getter):
+            try:
+                store = getter()
+            except Exception:
+                store = None
+        if store is None:
+            store = getattr(self, "_data_store", None)
+        updater = getattr(store, "update_history_status_by_finalize_keys", None)
+        if callable(updater):
+            try:
+                platform_records = updater(normalized_keys, status, reason)
+            except Exception as error:
+                logger.warning(
+                    f"历史状态定向更新失败，回退全量重写：{error}"
+                )
+                platform_records = None
+            if platform_records is not None:
+                self._record_platform_transfer_histories(platform_records)
+                if platform_records and self._history_changed:
+                    self._history_changed()
+                return
+
         uppercase_keys = {value.upper() for value in normalized_keys}
         platform_records = []
         with self._offline_pending_lock:
@@ -1961,6 +1995,24 @@ class HistoryService(OwnerDelegator):
         with self._offline_pending_lock:
             pending = self._get_data(self._OFFLINE_PENDING_KEY) or {}
             return [copy.deepcopy({**item, "pending_key": key}) for key, item in pending.items()]
+
+    def count_pending_finalize_tasks(self, fallback: int = 0) -> int:
+        """非阻塞地统计待后处理任务数量（v1.5.14）。
+
+        ``get_pending_finalize_tasks`` 需要 ``_offline_pending_lock``，而后处理
+        监控可能长时间持有该锁（含网盘 IO）。监控器与前端 API 在拿不到锁时
+        若仍走该路径，就会把线程一起挂住、直至 APScheduler 线程池耗尽。
+        这里改为「拿不到锁就返回调用方已知的计数」，只用于日志与展示。
+        """
+        if not self._get_data:
+            return 0
+        if not self._offline_pending_lock.acquire(blocking=False):
+            return int(fallback or 0)
+        try:
+            pending = self._get_data(self._OFFLINE_PENDING_KEY) or {}
+            return len(pending)
+        finally:
+            self._offline_pending_lock.release()
 
     def delete_pending_finalize_tasks(
             self,

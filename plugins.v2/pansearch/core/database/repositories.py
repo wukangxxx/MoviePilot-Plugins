@@ -215,6 +215,65 @@ class HistoryRepository(DbOper):
         return len(normalized)
 
     @db_update
+    def update_status_by_finalize_keys(
+            self,
+            finalize_keys: Iterable[str],
+            status: str,
+            reason: str = "",
+            db: Session = None,
+    ) -> List[Dict[str, Any]]:
+        """按 finalize_key 定向更新状态，返回更新后的记录副本。
+
+        v1.5.14：历史实现走 ``list_all`` + ``replace_all`` —— 一次状态变更
+        要拉出全部历史行、逐字段深比较、再整体写回。该方法位于后处理监控
+        的锁内（``_offline_pending_lock``），历史行数一多就把监控器、前端
+        刷新 API、后续调度 tick 全部堵在锁上，表现为「后处理长期卡住且
+        页面很慢」。这里改为只 UPDATE 命中行，复杂度从 O(全部历史) 降为
+        O(命中行数)。
+        """
+        keys = {
+            str(value or "").strip() for value in finalize_keys
+            if str(value or "").strip()
+        }
+        if not keys:
+            return []
+
+        changed_rows: List[HistoryRecord] = []
+        rows = db.scalars(
+            select(HistoryRecord).order_by(HistoryRecord.sort_index)
+        ).all()
+        for row in rows:
+            payload = row.payload or {}
+            item_key = str(
+                payload.get("finalize_key") or row.record_id or ""
+            ).strip()
+            if item_key not in keys:
+                continue
+
+            new_payload = copy.deepcopy(payload)
+            new_payload["status"] = status
+            new_payload.pop("finalize_key", None)
+            if status == "失败":
+                # 失败终态必须携带原因：优先本次原因，退回历史已有原因，
+                # 兜底占位文案，绝不允许失败记录无原因（v1.5.3 T3）。
+                new_payload["failure_reason"] = (
+                        str(reason or "").strip()
+                        or str(payload.get("failure_reason") or "").strip()
+                        or "未提供失败原因"
+                )
+            elif reason:
+                new_payload["failure_reason"] = reason
+            else:
+                new_payload.pop("failure_reason", None)
+
+            changes = {"payload": new_payload, "status": status}
+            row.update(db, changes)
+            changed_rows.append(row)
+
+        self._invalidate_filter_options()
+        return [copy.deepcopy(row.payload) for row in changed_rows]
+
+    @db_update
     def repair_group_keys(self, db: Session = None) -> int:
         """幂等回填旧记录的媒体分组键。"""
         repaired = 0

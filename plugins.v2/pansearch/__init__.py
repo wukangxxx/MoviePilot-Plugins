@@ -123,7 +123,7 @@ class PanSearch(_PluginBase):
     # 目录计算修正后存量处理中/下载中任务可自然推进终态；转存整理开关闭环
     # 确认（关闭时文件停在中转目录即完成，不建分类/不生成 STRM）；前端配置页
     # 新增电影/电视剧媒体目录字段并重建 dist。
-    plugin_version = "1.5.13"
+    plugin_version = "1.5.14"
     # 插件作者
     plugin_author = "odomu"
     # 作者主页

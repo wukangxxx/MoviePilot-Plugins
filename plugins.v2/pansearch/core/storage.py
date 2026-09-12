@@ -143,6 +143,21 @@ class PanSearchDataStore:
         self.initialize()
         return self.repositories.history.query_group_page(**kwargs)
 
+    def update_history_status_by_finalize_keys(
+            self, finalize_keys, status: str, reason: str = ""
+    ) -> list:
+        """按 finalize_key 定向更新历史状态（v1.5.14）。
+
+        历史实现走 ``load("history")`` + ``save("history", ...)``，一次状态
+        变更要全量读并整体重写全部历史行；该方法被后处理监控在
+        ``_offline_pending_lock`` 锁内调用，历史一多就把监控器与前端 API
+        全部堵死。这里直连仓储的定向 UPDATE，复杂度降到 O(命中行数)。
+        """
+        self.initialize()
+        return self.repositories.history.update_status_by_finalize_keys(
+            finalize_keys, status, reason
+        )
+
     def history_overview(
             self, today: str, recent_limit: int = 20
     ) -> Dict[str, Any]:

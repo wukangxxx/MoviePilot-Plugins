@@ -361,7 +361,10 @@ class TestEd2kPendingRegistration(unittest.TestCase):
             self._mediainfo(),
             staging_dir="",
         )
-        self.assertEqual(str(strm_path), "/tmp/should-not-be-used.strm")
+        # 路径分隔符在 Windows 上为反斜杠，统一归一后再比较
+        self.assertEqual(
+            str(strm_path).replace("\\", "/"), "/tmp/should-not-be-used.strm"
+        )
         self.assertEqual(pending_key, "")
         self.assertEqual(strm_calls["count"], 1)
 

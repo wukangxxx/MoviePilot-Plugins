@@ -266,7 +266,7 @@ class TestHardLimitCoversAllTaskTypes(unittest.TestCase):
             "            # v1.5.10：绝对时限早筛"
         )
         end = POSTPROCESS_SOURCE.index(
-            "            monitor_token = uuid.uuid4().hex"
+            "            monitor_token_early = uuid.uuid4().hex"
         )
         snippet = POSTPROCESS_SOURCE[start:end]
         self.assertNotIn(

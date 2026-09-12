@@ -1017,7 +1017,7 @@ class SyncRuntimeService(OwnerDelegator):
                 "checked": 0,
                 "completed": 0,
                 "failed": 0,
-                "pending": len(sync_handler.get_pending_finalize_tasks()),
+                "pending": self._count_pending_non_blocking(sync_handler),
             }
         shared_kwargs = dict(kwargs)
         if (
@@ -1073,7 +1073,7 @@ class SyncRuntimeService(OwnerDelegator):
                     )
                 for field in ("checked", "completed", "failed"):
                     totals[field] += int(result.get(field) or 0)
-        totals["pending"] = len(sync_handler.get_pending_finalize_tasks())
+        totals["pending"] = self._count_pending_non_blocking(sync_handler)
         return totals
 
     def _retry_group_isolated(
@@ -1109,6 +1109,22 @@ class SyncRuntimeService(OwnerDelegator):
                 totals[field] += int(result.get(field) or 0)
         return totals
 
+    @staticmethod
+    def _count_pending_non_blocking(sync_handler: Any, fallback: int = 0) -> int:
+        """不阻塞地读取待后处理数量（v1.5.14）。
+
+        优先使用 sync 侧的 ``count_pending_finalize_tasks``；拿不到锁时直接
+        返回调用方已知/上次的计数，绝不挂起调用线程。
+        """
+        counter = getattr(sync_handler, "count_pending_finalize_tasks", None)
+        if callable(counter):
+            try:
+                return int(counter(fallback) or 0)
+            except Exception:
+                return int(fallback or 0)
+        # 旧宿主无该接口：保守走原路径但限时不可行，退回 fallback
+        return int(fallback or 0)
+
     def _run_offline_monitor(self, **kwargs: Any) -> Dict[str, Any]:
         """按媒体队列并发执行网盘文件终态检查。"""
         sync_handler = self._sync_handler
@@ -1121,7 +1137,13 @@ class SyncRuntimeService(OwnerDelegator):
                 "pending": 0,
             }
         if not self._offline_monitor_lock.acquire(blocking=False):
-            pending_count = len(sync_handler.get_pending_finalize_tasks())
+            # v1.5.14：这里绝不能阻塞等待。后处理监控可能长时间持有
+            # ``_offline_pending_lock``（含网盘 IO），而
+            # ``get_pending_finalize_tasks`` 需要同一把锁；本路径同时服务于
+            # 调度器 tick 与前端刷新 API，一旦阻塞就会把线程堆在锁上，
+            # 直至 APScheduler 线程池耗尽 —— 表现为「后处理永久卡住 + 页面很慢」。
+            # 拿不到锁时退回调用方已知计数（仅用于日志与展示）。
+            pending_count = self._count_pending_non_blocking(sync_handler)
             logger.debug(
                 f"已有网盘文件后处理正在执行，本轮检查跳过"
                 f"（待处理 {pending_count} 个）"

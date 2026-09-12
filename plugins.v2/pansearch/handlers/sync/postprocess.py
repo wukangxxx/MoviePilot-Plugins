@@ -844,7 +844,14 @@ class PostprocessService(OwnerDelegator):
             # 递归定位（耗时数分钟到数十分钟）才可能走到判定逻辑，监控器被
             # 长期占满、队列看似「卡死」。这里在入口直接按创建时间收割超期
             # 任务，既保证 24 小时内必定出终态，也避免为判死而空扫网盘。
+            #
+            # v1.5.14：锁内只做内存态变更（挑选 + 摘除 + 记录待写历史），
+            # 所有落库动作（含历史定向更新）一律挪到锁外。历史实现直接在
+            # 锁内调 ``_mark_offline_history_status``，而它会全量读并整体
+            # 重写历史表；历史行数一多就把监控器、前端刷新 API、后续调度
+            # tick 全部堵在这把锁上，表现为「后处理长期卡住 + 页面很慢」。
             expired_keys: List[str] = []
+            expired_entries: List[Tuple[str, str, str]] = []
             for key in due_keys:
                 item = pending.get(key) or {}
                 try:
@@ -860,29 +867,48 @@ class PostprocessService(OwnerDelegator):
                     f"115 离线下载/转存后处理超过 {hours} 小时仍未完成，"
                     f"判定卡死退出（绝对兜底）"
                 )
-                self._mark_offline_history_status(key, "失败", reason)
                 file_name = str(item.get("file_name") or key)
-                logger.warning(f"{reason}：{file_name}")
+                expired_entries.append((key, file_name, reason))
                 pending.pop(key, None)
                 expired_keys.append(key)
             if expired_keys:
                 due_keys = [key for key in due_keys if key not in set(expired_keys)]
                 self._save_offline_pending(pending)
-                self._notify_offline_pending_changed(len(pending))
+                pending_count_after_expire = len(pending)
+            else:
+                pending_count_after_expire = -1
             expired_count = len(expired_keys)
             if not due_keys:
-                return {
-                    "checked": 0, "completed": 0, "failed": expired_count,
-                    "pending": len(pending),
-                }
+                pending_empty_count = len(pending)
+            else:
+                monitor_token_early = uuid.uuid4().hex
+                for key in due_keys:
+                    item = pending[key]
+                    item["_monitor_token"] = monitor_token_early
+                    item["_monitor_until"] = (
+                            now + self._OFFLINE_MONITOR_LEASE_SECONDS
+                    )
+                self._save_offline_pending(pending)
+                pending_empty_count = 0
 
-            monitor_token = uuid.uuid4().hex
-            for key in due_keys:
-                item = pending[key]
-                item["_monitor_token"] = monitor_token
-                item["_monitor_until"] = now + self._OFFLINE_MONITOR_LEASE_SECONDS
-            self._save_offline_pending(pending)
-            pending_snapshot = copy.deepcopy(pending)
+        # ---- 以下全部在 _offline_pending_lock 之外 ----
+        if expired_entries:
+            for _key, file_name, reason in expired_entries:
+                logger.warning(f"{reason}：{file_name}")
+            self._mark_offline_history_status_batch(
+                {key for key, _f, _r in expired_entries},
+                "失败",
+                expired_entries[0][2],
+            )
+            if pending_count_after_expire >= 0:
+                self._notify_offline_pending_changed(pending_count_after_expire)
+        if not due_keys:
+            return {
+                "checked": 0, "completed": 0, "failed": expired_count,
+                "pending": pending_empty_count,
+            }
+        monitor_token = monitor_token_early
+        pending_snapshot = copy.deepcopy(pending)
         completed = 0
         failed = expired_count
         finalized_details: List[Dict[str, Any]] = []

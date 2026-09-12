@@ -832,6 +832,46 @@ class PostprocessService(OwnerDelegator):
             if not due_keys:
                 return {"checked": 0, "completed": 0, "failed": 0, "pending": len(pending)}
 
+            # v1.5.10：绝对时限早筛，必须在任何网盘重活（全盘递归检索）之前。
+            # 历史故障：ED2K/磁力任务一旦越过超时点，其 next_check_at 被钉在
+            # 过去的固定时刻，每轮都「已到期」，于是每轮都要先做一次 115 全盘
+            # 递归定位（耗时数分钟到数十分钟）才可能走到判定逻辑，监控器被
+            # 长期占满、队列看似「卡死」。这里在入口直接按创建时间收割超期
+            # 任务，既保证 24 小时内必定出终态，也避免为判死而空扫网盘。
+            expired_keys: List[str] = []
+            for key in due_keys:
+                item = pending.get(key) or {}
+                if str(item.get("task_type") or "share") not in {"ed2k", "magnet"}:
+                    continue
+                try:
+                    created_at = float(item.get("created_at") or 0)
+                except (TypeError, ValueError):
+                    created_at = 0.0
+                if created_at <= 0:
+                    continue
+                if now - created_at < self._OFFLINE_ED2K_HARD_LIMIT:
+                    continue
+                hours = self._OFFLINE_ED2K_HARD_LIMIT // 3600
+                reason = (
+                    f"115 离线下载超过 {hours} 小时仍未完成，"
+                    f"判定卡死退出（绝对兜底）"
+                )
+                self._mark_offline_history_status(key, "失败", reason)
+                file_name = str(item.get("file_name") or key)
+                logger.warning(f"{reason}：{file_name}")
+                pending.pop(key, None)
+                expired_keys.append(key)
+            if expired_keys:
+                due_keys = [key for key in due_keys if key not in set(expired_keys)]
+                self._save_offline_pending(pending)
+                self._notify_offline_pending_changed(len(pending))
+            expired_count = len(expired_keys)
+            if not due_keys:
+                return {
+                    "checked": 0, "completed": 0, "failed": expired_count,
+                    "pending": len(pending),
+                }
+
             monitor_token = uuid.uuid4().hex
             for key in due_keys:
                 item = pending[key]
@@ -840,7 +880,7 @@ class PostprocessService(OwnerDelegator):
             self._save_offline_pending(pending)
             pending_snapshot = copy.deepcopy(pending)
         completed = 0
-        failed = 0
+        failed = expired_count
         finalized_details: List[Dict[str, Any]] = []
         notification_contexts: List[Tuple[Dict[str, Any], str]] = []
         subscription_batches: Dict[Tuple[Any, ...], Dict[str, Any]] = {}

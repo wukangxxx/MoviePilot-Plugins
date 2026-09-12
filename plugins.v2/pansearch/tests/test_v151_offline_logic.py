@@ -691,6 +691,8 @@ class TestTimeoutReadySameRoundFinalize(unittest.TestCase):
             pass
 
         stub = Stub()
+        # v1.5.10：入口早筛会读取该常量，桩上必须存在。
+        stub._OFFLINE_ED2K_HARD_LIMIT = 24 * 60 * 60
         state = {"offline_pending_tasks": {"pending:1": item}}
         calls = {"steps": []}
 
@@ -876,6 +878,8 @@ class TestOfflineHistoryBackfill(unittest.TestCase):
             pass
 
         stub = Stub()
+        # v1.5.10：入口早筛会读取该常量，桩上必须存在。
+        stub._OFFLINE_ED2K_HARD_LIMIT = 24 * 60 * 60
         state = {
             "history": history,
             "offline_pending_tasks": pending or {},

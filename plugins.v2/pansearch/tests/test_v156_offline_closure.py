@@ -221,9 +221,10 @@ class TestStopServiceNoSelfJoin(unittest.TestCase):
         self.assertNotIn(".shutdown()", INIT_SOURCE)
 
     def test_both_schedulers_shutdown_nonblocking(self):
-        self.assertIn("self._scheduler.shutdown(wait=False)", INIT_SOURCE)
-        self.assertIn("self._offline_scheduler.shutdown(wait=False)",
-                      INIT_SOURCE)
+        # v1.5.10：改为「先摘引用、再关调度器」（局部变量 shutdown），
+        # 消除 .running 竞态窗口；非阻塞语义不变。
+        self.assertIn("scheduler.shutdown(wait=False)", INIT_SOURCE)
+        self.assertIn("offline_scheduler.shutdown(wait=False)", INIT_SOURCE)
 
     def test_runtime_teardown_stays_nonblocking(self):
         # runtime.py 清空队列处同样必须非阻塞，两处语义保持一致。

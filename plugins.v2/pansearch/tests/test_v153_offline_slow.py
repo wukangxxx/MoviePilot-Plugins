@@ -125,6 +125,7 @@ class TestOfflineSlowDownloadVerdict(unittest.TestCase):
         stub = Stub()
         namespace = {
             "logger": _StubLogger(),
+            "time": time,
             "Dict": typing.Dict,
             "Any": typing.Any,
             "Optional": typing.Optional,
@@ -135,6 +136,8 @@ class TestOfflineSlowDownloadVerdict(unittest.TestCase):
             _bind(stub, namespace, name)
         stub._OFFLINE_TIMEOUT = timeout_seconds
         stub._OFFLINE_ZERO_GROWTH_ROUNDS = 3
+        # v1.5.10：ED2K 绝对兜底常量。
+        stub._OFFLINE_ED2K_HARD_LIMIT = 24 * 60 * 60
         return stub
 
     def test_first_timeout_round_records_baseline_and_waits(self):
@@ -280,6 +283,7 @@ class TestMonitorSlowDownloadBranches(unittest.TestCase):
         for name, source in self._helpers.items():
             helper_namespace = {
                 "logger": _StubLogger(),
+                "time": time,
                 "Dict": typing.Dict,
                 "Any": typing.Any,
                 "Optional": typing.Optional,
@@ -294,6 +298,8 @@ class TestMonitorSlowDownloadBranches(unittest.TestCase):
         stub._OFFLINE_MONITOR_LEASE_SECONDS = 300
         stub._OFFLINE_TIMEOUT = 120 * 60
         stub._OFFLINE_ZERO_GROWTH_ROUNDS = 3
+        # v1.5.10：ED2K 绝对兜底常量，供 _offline_slow_download_verdict 使用。
+        stub._OFFLINE_ED2K_HARD_LIMIT = 24 * 60 * 60
         stub._cloud_directories = _CloudDirectories()
         stub._cloud_query = object()
         stub._cloud_mutations = object()

@@ -40,6 +40,11 @@ class PostprocessService(OwnerDelegator):
     )
     # 超时后连续零增长复查轮数上限，达到即判定卡死失败。
     _OFFLINE_ZERO_GROWTH_ROUNDS = 3
+    # 复查时间下限：任何情况下 next_check_at 都不得早于 now + 该值，
+    # 杜绝「next_check_at 被钉死在过去 → 每轮都到期」的空转（v1.5.10）。
+    _OFFLINE_MIN_RETRY_SECONDS = 10
+    # ED2K 绝对兜底：创建后超过该时长仍未终结的任务强制判失败，不再无限复查。
+    _OFFLINE_ED2K_HARD_LIMIT = 24 * 60 * 60
 
     @staticmethod
     def _postprocess_task_id(item: Dict[str, Any]) -> str:
@@ -351,10 +356,28 @@ class PostprocessService(OwnerDelegator):
         -> ("fail", 卡死原因)。进度基线与零增长轮数持久化在 pending
         载荷 JSON（timeout_progress_percent / offline_zero_growth_rounds），
         旧记录缺键时按首轮基线 / 0 轮处理。
+
+        v1.5.10：增加「绝对兜底」——ED2K/magnet 任务创建超过
+        _OFFLINE_ED2K_HARD_LIMIT 仍未终结，无论进度如何一律判失败。
+        因为零增长熔断依赖基线键持久化，而历史上出现过基线键缺失导致
+        计数器永远从 0 开始、熔断永不触发的无限重试（表现为永久
+        「后处理中」且停止不了）。
         """
         if task is None:
             # 任务句柄不存在：网盘侧已消失且文件终审未就绪，真实失败。
             return "fail", self._offline_timeout_fail_reason(prefix)
+        try:
+            created_at = float(item.get("created_at") or 0)
+        except (TypeError, ValueError):
+            created_at = 0.0
+        if created_at > 0 and (
+                time.time() - created_at >= self._OFFLINE_ED2K_HARD_LIMIT
+        ):
+            hours = self._OFFLINE_ED2K_HARD_LIMIT // 3600
+            return "fail", (
+                f"115 离线下载超过 {hours} 小时仍未完成，"
+                f"判定卡死退出（绝对兜底）"
+            )
         try:
             percent = max(0.0, min(float(task.get("percent") or 0.0), 100.0))
         except (TypeError, ValueError):
@@ -2256,10 +2279,19 @@ class PostprocessService(OwnerDelegator):
             len(self._OFFLINE_CHECK_DELAYS) - 1,
         )
         item["check_index"] = check_index
-        retry_at = now + self._OFFLINE_CHECK_DELAYS[check_index]
+        delay = self._OFFLINE_CHECK_DELAYS[check_index]
+        retry_at = now + delay
         if str(item.get("task_type") or "share") in {"ed2k", "magnet"}:
             created_at = float(item.get("created_at") or now)
-            retry_at = min(retry_at, created_at + self._OFFLINE_TIMEOUT)
+            deadline = created_at + self._OFFLINE_TIMEOUT
+            # 原意是「把复查提前到超时判定点之前」，但一旦 now 已越过 deadline，
+            # min() 会把 next_check_at 钉死在过去的固定时刻 —— 该记录此后每轮都
+            # 判为「已到期」，形成永不退避的空转（v1.5.10 修复：ED2K 无限重试）。
+            # 因此仅在 deadline 尚未到达时才允许提前；否则退化为按延迟正常退避。
+            if now < deadline:
+                retry_at = min(retry_at, deadline)
+        # 兜底：任何情况下复查时间都不得早于当前时刻 + 最小间隔，杜绝空转。
+        retry_at = max(retry_at, now + self._OFFLINE_MIN_RETRY_SECONDS)
         item["next_check_at"] = retry_at
         retry_minutes = max(1, int(max(0, retry_at - now) + 59) // 60)
         logger.debug(

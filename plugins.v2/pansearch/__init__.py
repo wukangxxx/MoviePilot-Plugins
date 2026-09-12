@@ -123,7 +123,7 @@ class PanSearch(_PluginBase):
     # 目录计算修正后存量处理中/下载中任务可自然推进终态；转存整理开关闭环
     # 确认（关闭时文件停在中转目录即完成，不建分类/不生成 STRM）；前端配置页
     # 新增电影/电视剧媒体目录字段并重建 dist。
-    plugin_version = "1.5.9"
+    plugin_version = "1.5.10"
     # 插件作者
     plugin_author = "odomu"
     # 作者主页
@@ -2012,21 +2012,28 @@ class PanSearch(_PluginBase):
         # 由于本方法跑在 uvicorn 主线程上，会直接冻结事件循环——
         # 表现为页面能开、所有 /api/v1 请求一直挂起、无法登录。
         # runtime.py 中清空队列处同样使用 wait=False，此处保持一致。
+        #
+        # v1.5.10：务必「先摘引用、再关调度器」。若先 shutdown(wait=False) 再置空，
+        # 存在一个竞态窗口：shutdown 返回后 .running 仍可能短暂为 True，而 job 已被
+        # remove_all_jobs() 摘除；此时若其他路径（_update_offline_monitor）读到该实例
+        # 并调用 modify_job，会抛 JobLookupError 导致离线监控器再也无法重建。
         try:
-            if self._scheduler:
-                self._scheduler.remove_all_jobs()
-                if self._scheduler.running:
-                    self._scheduler.shutdown(wait=False)
-                self._scheduler = None
+            scheduler = self._scheduler
+            self._scheduler = None
+            if scheduler:
+                scheduler.remove_all_jobs()
+                if scheduler.running:
+                    scheduler.shutdown(wait=False)
         except Exception:
             pass
 
         try:
-            if self._offline_scheduler:
-                self._offline_scheduler.remove_all_jobs()
-                if self._offline_scheduler.running:
-                    self._offline_scheduler.shutdown(wait=False)
-                self._offline_scheduler = None
+            offline_scheduler = self._offline_scheduler
+            self._offline_scheduler = None
+            if offline_scheduler:
+                offline_scheduler.remove_all_jobs()
+                if offline_scheduler.running:
+                    offline_scheduler.shutdown(wait=False)
         except Exception:
             pass
 

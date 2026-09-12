@@ -826,14 +826,32 @@ class SyncRuntimeService(OwnerDelegator):
         logger.info(f"收到单任务停止请求：{task.get('title')}（{task_id}）")
         return {"success": True, "message": f"已请求停止：{task.get('title')}"}
 
+    # 安全停止等待后处理原子提交的最长时间（秒）。超时后不再无限等待，
+    # 直接移除未开始的持久任务并标记已停止，避免「停止不了」。
+    _POSTPROCESS_STOP_WAIT_SECONDS = 30
+
     def _finish_postprocessing_stop(
             self,
             task_id: str,
             task_snapshot: Dict[str, Any],
     ) -> None:
-        """等待当前后处理原子提交完成，再移除尚未开始的持久任务。"""
+        """等待当前后处理原子提交完成，再移除尚未开始的持久任务。
+
+        v1.5.10：对 _offline_monitor_lock 的等待加入超时。历史故障中，
+        监控任务长时间持有该锁（内部含网盘网络请求），导致本停止线程在
+        acquire() 上永久阻塞，任务卡在 stopping，前端表现为「停止不了」。
+        超时后仍继续执行清理逻辑：宁可提前移除尚未开始的任务，也不能让
+        用户无法停止。
+        """
         stop_token = str(task_snapshot.get("postprocess_stop_token") or "")
-        self._offline_monitor_lock.acquire()
+        acquired = self._offline_monitor_lock.acquire(
+            timeout=self._POSTPROCESS_STOP_WAIT_SECONDS
+        )
+        if not acquired:
+            logger.warning(
+                f"等待后处理原子提交超时（{self._POSTPROCESS_STOP_WAIT_SECONDS}s），"
+                f"强制结束停止流程：{task_snapshot.get('title')}"
+            )
         try:
             with self._sync_tasks_lock:
                 current = self._sync_tasks.get(task_id)
@@ -886,7 +904,8 @@ class SyncRuntimeService(OwnerDelegator):
                 f"{task_snapshot.get('title')}，{error}"
             )
         finally:
-            self._offline_monitor_lock.release()
+            if acquired:
+                self._offline_monitor_lock.release()
             self._mark_runtime_changed()
 
     def _monitor_offline_task_groups(
@@ -1295,35 +1314,68 @@ class SyncRuntimeService(OwnerDelegator):
             logger.error(f"批量删除离线任务失败：{error}")
             return {"success": False, "message": str(error)}
 
+    def _start_offline_monitor_scheduler(
+            self, pending_count: int
+    ) -> Optional[BackgroundScheduler]:
+        """构建并启动离线监控调度器；失败返回 None。"""
+        try:
+            scheduler = BackgroundScheduler(timezone=settings.TZ)
+            scheduler.add_job(
+                func=self.monitor_offline_tasks,
+                trigger=IntervalTrigger(seconds=20),
+                id="PanSearch_OfflineMonitor",
+                next_run_time=datetime.datetime.now(
+                    tz=pytz.timezone(settings.TZ)
+                ) + datetime.timedelta(seconds=3),
+                max_instances=2,
+                coalesce=True,
+                replace_existing=True,
+            )
+            scheduler.start()
+        except Exception as error:
+            logger.error(f"启动网盘文件终态后处理监控失败：{error}")
+            return None
+        self._offline_scheduler = scheduler
+        logger.debug(f"网盘文件终态后处理监控已启动（待处理 {pending_count} 个）")
+        return scheduler
+
     def _update_offline_monitor(self, pending_count: int) -> None:
-        """仅在存在待后处理文件时运行独立监控。"""
+        """仅在存在待后处理文件时运行独立监控。
+
+        v1.5.10：本方法必须保证「监控器一定存在且确实在跑」。
+        历史故障：停机清理（stop_service）会对旧调度器执行 remove_all_jobs()
+        + shutdown(wait=False)，但 shutdown 返回后 .running 仍可能短暂为 True，
+        而 job 已被摘除。此时调用 modify_job 会抛 JobLookupError 并向上冒泡，
+        导致监控器再也无法重建 —— 表现为待处理任务永久「后处理中」且停止不了。
+        因此这里对 modify_job 做兜底，任何异常都降级为重建调度器。
+        """
         self._refresh_postprocessing_sync_tasks()
         with self._offline_scheduler_lock:
             scheduler = self._offline_scheduler
             if pending_count > 0:
                 if scheduler and scheduler.running:
-                    scheduler.modify_job(
-                        "PanSearch_OfflineMonitor",
-                        next_run_time=datetime.datetime.now(
-                            tz=pytz.timezone(settings.TZ)
-                        ) + datetime.timedelta(seconds=1),
-                    )
-                    return
-                scheduler = BackgroundScheduler(timezone=settings.TZ)
-                scheduler.add_job(
-                    func=self.monitor_offline_tasks,
-                    trigger=IntervalTrigger(seconds=20),
-                    id="PanSearch_OfflineMonitor",
-                    next_run_time=datetime.datetime.now(
-                        tz=pytz.timezone(settings.TZ)
-                    ) + datetime.timedelta(seconds=3),
-                    max_instances=2,
-                    coalesce=True,
-                    replace_existing=True,
-                )
-                scheduler.start()
-                self._offline_scheduler = scheduler
-                logger.debug(f"网盘文件终态后处理监控已启动（待处理 {pending_count} 个）")
+                    try:
+                        scheduler.modify_job(
+                            "PanSearch_OfflineMonitor",
+                            next_run_time=datetime.datetime.now(
+                                tz=pytz.timezone(settings.TZ)
+                            ) + datetime.timedelta(seconds=1),
+                        )
+                        return
+                    except Exception as error:
+                        # job 已不存在（或调度器处于不可用状态）：降级重建，
+                        # 绝不允许异常逃逸导致监控器永久死亡。
+                        logger.warning(
+                            f"复用网盘文件终态监控失败，重建调度器：{error}"
+                        )
+                        try:
+                            scheduler.remove_all_jobs()
+                            if scheduler.running:
+                                scheduler.shutdown(wait=False)
+                        except Exception:
+                            pass
+                        self._offline_scheduler = None
+                self._start_offline_monitor_scheduler(pending_count)
                 return
 
             if not scheduler:

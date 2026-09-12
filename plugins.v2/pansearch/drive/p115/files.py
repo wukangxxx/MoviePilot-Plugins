@@ -165,8 +165,14 @@ class P115FileMutation:
         return self.manager.rename_file_by_sha1(path, checksum, target_name, **kwargs)
 
     def rename_file(self, path: str, item: CloudFile, target_name: str) -> bool:
+        # item 可能是 CloudFile，也可能是提供方原始 dict（整包 magnet 终态
+        # 链路会把 dict 形态的条目透传到驱动层）。统一归一化后再取 .name，
+        # 否则直接读属性会抛 AttributeError: 'dict' object has no attribute 'name'。
+        normalized = item if isinstance(item, CloudFile) else cloud_file(item)
+        if normalized is None:
+            return False
         return self.manager.rename_file_item(
-            path, native_dict(item), item.name, target_name
+            path, native_dict(normalized), normalized.name, target_name
         )
 
     def move_file(

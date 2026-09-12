@@ -148,6 +148,49 @@ class TestNoBareNameAccess(unittest.TestCase):
         self.assertIn("self._cloud_entry_name(value)", POSTPROCESS_SOURCE)
 
 
+class TestDriverNormalizesEntry(unittest.TestCase):
+    """F3 收尾：驱动层变更接口必须容忍 dict 形态的云条目。
+
+    真实 traceback（v1.5.7 热更后仍在报错，靠容器内注入 traceback 才抓到）：
+
+        postprocess.py:1309  monitor_offline_strm_tasks
+          → postprocess.py:2093  _finalize_magnet_package
+            → core/cloud.py:454  guarded
+              → drive/p115/files.py:169  rename_file
+                    path, native_dict(item), item.name, target_name
+                                             ^^^^^^^^^
+        AttributeError: 'dict' object has no attribute 'name'
+
+    ``_finalize_magnet_package`` 里 ``source_file`` 来自 ``_match_movie_file`` /
+    ``_match_episode_files``，是**目录快照里的提供方原始 dict**（整包 magnet
+    场景下 115 返回 dict）。上游用 ``_cloud_entry_name`` / ``.get()`` 都不会崩，
+    唯独驱动层按 CloudFile 契约读 ``item.name`` 才炸——这也解释了为什么
+    「关 organize 走 rename_file 报错、开 organize 走 move_file 不报错」
+    （``move_file`` 用的是 ``native_dict(item)``，本身兼容 Mapping）。
+    """
+
+    P115_FILES = (
+        PLUGIN_ROOT / "drive" / "p115" / "files.py"
+    ).read_text(encoding="utf-8")
+
+    def test_p115_rename_file_normalizes_entry(self):
+        self.assertNotIn("path, native_dict(item), item.name, target_name",
+                         self.P115_FILES)
+        self.assertIn("normalized = item if isinstance(item, CloudFile) "
+                      "else cloud_file(item)", self.P115_FILES)
+        self.assertIn("normalized.name", self.P115_FILES)
+
+    def test_p115_rename_file_guards_none(self):
+        # cloud_file() 可能返回 None（缺 file_id/name），必须显式判空，
+        # 否则归一化失败会变成属性错误，比原 bug 更难定位。
+        self.assertIn("if normalized is None:", self.P115_FILES)
+
+    def test_move_file_stays_mapping_tolerant(self):
+        # move_file 用 native_dict(item) 已兼容 Mapping，不得被改回裸属性读取。
+        self.assertIn("native_dict(item), save_path, target_name",
+                      self.P115_FILES)
+
+
 class TestRuntimeIsolation(unittest.TestCase):
     """F2：整组失败降级逐条重试，且失败日志带 traceback。"""
 

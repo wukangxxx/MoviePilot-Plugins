@@ -24,11 +24,13 @@ SUBTITLES_PATH = PLUGIN_ROOT / "handlers" / "sync" / "subtitles.py"
 SERVICE_PATH = PLUGIN_ROOT / "handlers" / "sync" / "service.py"
 HISTORY_PATH = PLUGIN_ROOT / "handlers" / "sync" / "history.py"
 RUNTIME_PATH = PLUGIN_ROOT / "core" / "services" / "runtime.py"
+INIT_PATH = PLUGIN_ROOT / "__init__.py"
 
 POSTPROCESS_SOURCE = POSTPROCESS_PATH.read_text(encoding="utf-8")
 SUBTITLES_SOURCE = SUBTITLES_PATH.read_text(encoding="utf-8")
 HISTORY_SOURCE = HISTORY_PATH.read_text(encoding="utf-8")
 RUNTIME_SOURCE = RUNTIME_PATH.read_text(encoding="utf-8")
+INIT_SOURCE = INIT_PATH.read_text(encoding="utf-8")
 
 
 class _RetrySentinel(Exception):
@@ -189,6 +191,43 @@ class TestDriverNormalizesEntry(unittest.TestCase):
         # move_file 用 native_dict(item) 已兼容 Mapping，不得被改回裸属性读取。
         self.assertIn("native_dict(item), save_path, target_name",
                       self.P115_FILES)
+
+
+class TestStopServiceNoSelfJoin(unittest.TestCase):
+    """v1.5.9：stop_service 关闭调度器必须非阻塞，防止自杀式死锁。
+
+    真实故障（py-spy 抓到的冻结栈，v1.5.8 热更后 15:12:45 起再也登不进）：
+
+        MainThread
+          → shutdown (concurrent/futures/thread.py:239)   ← join 执行器 worker
+          → shutdown (apscheduler/executors/pool.py:33)
+          → shutdown (apscheduler/schedulers/background.py:40)
+          → stop_service (__init__.py:2019)
+          → PluginManager.init_config → sync_plugins
+
+    MoviePilot 检测到第三方插件更新后调用 ``init_config()``，它会先
+    ``stop()`` 所有插件。此时 PanSearch 的 ``_offline_scheduler`` 有 job
+    正在执行 ``monitor_offline_strm_tasks``（全盘递归扫描 115 目录，见
+    ``list_files_recursive``，耗时不可控）。APScheduler 的 ``shutdown``
+    默认 ``wait=True``，会在执行器线程池上 join，等待这个跑不完的 job，
+    而 ``stop_service`` 又跑在 uvicorn 主线程上——事件循环被永久冻结：
+    页面能打开、所有 ``/api/v1`` 请求一直挂起、无法登录。
+
+    约束：两处调度器关闭都必须显式 ``wait=False``。
+    """
+
+    def test_no_bare_scheduler_shutdown(self):
+        # 不允许出现无参 shutdown()，默认 wait=True 就是死锁根源。
+        self.assertNotIn(".shutdown()", INIT_SOURCE)
+
+    def test_both_schedulers_shutdown_nonblocking(self):
+        self.assertIn("self._scheduler.shutdown(wait=False)", INIT_SOURCE)
+        self.assertIn("self._offline_scheduler.shutdown(wait=False)",
+                      INIT_SOURCE)
+
+    def test_runtime_teardown_stays_nonblocking(self):
+        # runtime.py 清空队列处同样必须非阻塞，两处语义保持一致。
+        self.assertIn("scheduler.shutdown(wait=False)", RUNTIME_SOURCE)
 
 
 class TestRuntimeIsolation(unittest.TestCase):

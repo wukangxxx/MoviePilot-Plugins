@@ -123,7 +123,7 @@ class PanSearch(_PluginBase):
     # 目录计算修正后存量处理中/下载中任务可自然推进终态；转存整理开关闭环
     # 确认（关闭时文件停在中转目录即完成，不建分类/不生成 STRM）；前端配置页
     # 新增电影/电视剧媒体目录字段并重建 dist。
-    plugin_version = "1.5.8"
+    plugin_version = "1.5.9"
     # 插件作者
     plugin_author = "odomu"
     # 作者主页
@@ -2003,11 +2003,20 @@ class PanSearch(_PluginBase):
                 platform_service.close()
         except Exception as error:
             logger.debug(f"关闭平台缓存失败：{error}")
+        # 注意：必须使用 shutdown(wait=False)。
+        # 本方法可能在调度器自身的 job 线程内被间接触发
+        # （monitor_offline_tasks → _refresh_postprocessing_sync_tasks
+        #   → 插件同步 → PluginManager.init_config → stop → stop_service）。
+        # 此时若按 APScheduler 默认 wait=True 关闭，BlockingScheduler 会在
+        # 执行器线程池上 join 掉「包含当前线程」的 worker，形成自我等待，
+        # 由于本方法跑在 uvicorn 主线程上，会直接冻结事件循环——
+        # 表现为页面能开、所有 /api/v1 请求一直挂起、无法登录。
+        # runtime.py 中清空队列处同样使用 wait=False，此处保持一致。
         try:
             if self._scheduler:
                 self._scheduler.remove_all_jobs()
                 if self._scheduler.running:
-                    self._scheduler.shutdown()
+                    self._scheduler.shutdown(wait=False)
                 self._scheduler = None
         except Exception:
             pass
@@ -2016,7 +2025,7 @@ class PanSearch(_PluginBase):
             if self._offline_scheduler:
                 self._offline_scheduler.remove_all_jobs()
                 if self._offline_scheduler.running:
-                    self._offline_scheduler.shutdown()
+                    self._offline_scheduler.shutdown(wait=False)
                 self._offline_scheduler = None
         except Exception:
             pass

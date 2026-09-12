@@ -343,6 +343,8 @@ class _F1Harness(unittest.TestCase):
         stub._OFFLINE_MONITOR_LEASE_SECONDS = 300
         stub._OFFLINE_TIMEOUT = 1800
         stub._FILE_FINALIZE_TIMEOUT = 1800
+        stub._OFFLINE_ED2K_HARD_LIMIT = 24 * 60 * 60
+        stub._STAGING_HANDOFF_GRACE_SECONDS = 300
         stub._cloud_directories = _CloudDirectories()
         stub._cloud_query = object()
         stub._cloud_mutations = object()
@@ -425,9 +427,9 @@ class TestOrganizeOffExternalTakeover(_F1Harness):
         self.assertEqual(handler.history, [("pending:1", "成功", "")])
         self.assertEqual(handler.strm_calls["count"], 0)
 
-    def test_never_seen_still_waits(self):
-        # 从未在转存目录出现过：不能误判成功，必须继续等待（走重试）。
-        item = self._base_item()
+    def test_never_seen_still_waits_within_grace(self):
+        """观察期内（v1.5.12 F2）不可误判成功，必须继续等待（走重试）。"""
+        item = self._base_item(created_at=time.time() - 10)
         handler = self._make_handler(item, entries=[], organize=False)
         with self.assertRaises(_RetrySentinel):
             handler.monitor_offline_strm_tasks(
@@ -435,15 +437,40 @@ class TestOrganizeOffExternalTakeover(_F1Harness):
             )
         self.assertIn("pending:1", handler.state["offline_pending_tasks"])
 
-    def test_organize_on_still_waits_for_file(self):
-        # 整理开启时保持原有语义：文件未就位仍需等待，不得直接判终。
-        item = self._base_item(staging_seen_at=time.time() - 600)
+    def test_never_seen_after_grace_converges(self):
+        """v1.5.12 F2：越过观察期且文件仍未出现在转存目录，判定已被
+        外部流程接管并收敛出队，不再死等到终审窗口后全盘递归。"""
+        item = self._base_item(created_at=time.time() - 4000)
+        handler = self._make_handler(item, entries=[], organize=False)
+        result = handler.monitor_offline_strm_tasks(
+            offline_tasks=[], offline_tasks_valid=True
+        )
+        self.assertEqual(result["completed"], 1)
+        self.assertEqual(result["failed"], 0)
+        self.assertEqual(handler.state["offline_pending_tasks"], {})
+
+    def test_organize_on_still_waits_within_grace(self):
+        """整理开启时：观察期内文件未就位仍需等待，不得直接判终。"""
+        item = self._base_item(
+            staging_seen_at=time.time() - 600, created_at=time.time() - 10
+        )
         handler = self._make_handler(item, entries=[], organize=True)
         with self.assertRaises(_RetrySentinel):
             handler.monitor_offline_strm_tasks(
                 offline_tasks=[], offline_tasks_valid=True
             )
         self.assertIn("pending:1", handler.state["offline_pending_tasks"])
+
+    def test_organize_on_after_grace_converges(self):
+        """v1.5.12 F2：整理开启但文件已被外部接走时同样收敛，避免死循环。"""
+        item = self._base_item(
+            staging_seen_at=time.time() - 600, created_at=time.time() - 4000
+        )
+        handler = self._make_handler(item, entries=[], organize=True)
+        result = handler.monitor_offline_strm_tasks(
+            offline_tasks=[], offline_tasks_valid=True
+        )
+        self.assertEqual(result["completed"], 1)
 
 
 class TestF1SourceWiring(_F1Harness):

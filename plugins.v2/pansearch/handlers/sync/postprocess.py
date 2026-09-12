@@ -43,8 +43,14 @@ class PostprocessService(OwnerDelegator):
     # 复查时间下限：任何情况下 next_check_at 都不得早于 now + 该值，
     # 杜绝「next_check_at 被钉死在过去 → 每轮都到期」的空转（v1.5.10）。
     _OFFLINE_MIN_RETRY_SECONDS = 10
-    # ED2K 绝对兜底：创建后超过该时长仍未终结的任务强制判失败，不再无限复查。
+    # 绝对兜底：创建后超过该时长仍未终结的任务强制判失败，不再无限复查。
+    # v1.5.12 F3：原实现只对 ed2k/magnet 生效，分享转存（share）任务在
+    # 「文件被外部流程整理走」的场景下同样会无限复查，故扩展为全类型。
     _OFFLINE_ED2K_HARD_LIMIT = 24 * 60 * 60
+    # v1.5.12 F2：转存目录可正常列举、但目标文件从未在该目录出现，且距
+    # 登记已超过该观察期，即判定文件已被外部流程（MoviePilot 目录整理等）
+    # 接管移走，直接收敛出队；不再死等到终审窗口再全盘递归定位。
+    _STAGING_HANDOFF_GRACE_SECONDS = 300
 
     @staticmethod
     def _postprocess_task_id(item: Dict[str, Any]) -> str:
@@ -841,8 +847,6 @@ class PostprocessService(OwnerDelegator):
             expired_keys: List[str] = []
             for key in due_keys:
                 item = pending.get(key) or {}
-                if str(item.get("task_type") or "share") not in {"ed2k", "magnet"}:
-                    continue
                 try:
                     created_at = float(item.get("created_at") or 0)
                 except (TypeError, ValueError):
@@ -853,7 +857,7 @@ class PostprocessService(OwnerDelegator):
                     continue
                 hours = self._OFFLINE_ED2K_HARD_LIMIT // 3600
                 reason = (
-                    f"115 离线下载超过 {hours} 小时仍未完成，"
+                    f"115 离线下载/转存后处理超过 {hours} 小时仍未完成，"
                     f"判定卡死退出（绝对兜底）"
                 )
                 self._mark_offline_history_status(key, "失败", reason)
@@ -1539,6 +1543,9 @@ class PostprocessService(OwnerDelegator):
                 target_file = moved_files.get(pending_key) or prepared_files.get(pending_key)
                 if target_file:
                     file_index = {}
+                    # v1.5.12：保持 directory_valid 恒有定义，供下方
+                    # 「外部流程接管」判定使用，避免 NameError。
+                    directory_valid = True
                 else:
                     directory_valid, file_index = directory_snapshot(staging_dir)
                     if not directory_valid:
@@ -1581,6 +1588,30 @@ class PostprocessService(OwnerDelegator):
                         logger.info(
                             f"转存后整理已关闭，文件已由外部流程接管，"
                             f"直接完成：{file_name}"
+                        )
+                        media, media_data = self._restore_pending_media_context(
+                            item, pending_key
+                        )
+                        finalize_after_metadata(
+                            item, pending_key, file_name, None, media, media_data
+                        )
+                        continue
+                    # v1.5.12 F2：文件从未在转存目录出现过（staging_seen_at
+                    # 缺失），但转存目录本身可正常列举 —— 说明文件落盘后已被
+                    # 外部流程（MoviePilot 目录整理等）接走。此时既等不到
+                    # staging 命中，也等不到插件自算媒体目录命中（外部命名
+                    # 与插件规范名不同），历史实现只能死等到 120 分钟终审
+                    # 窗口再全盘递归，表现为「后处理永久卡死且停止不了」。
+                    # 这里在观察期后直接按「已由外部流程接管」收敛出队。
+                    if (
+                            not target_file
+                            and directory_valid
+                            and now - float(created_at or 0)
+                            >= self._STAGING_HANDOFF_GRACE_SECONDS
+                    ):
+                        logger.info(
+                            f"文件已离开转存目录，判定由外部流程接管，"
+                            f"直接完成：{file_name}（{staging_dir}）"
                         )
                         media, media_data = self._restore_pending_media_context(
                             item, pending_key
@@ -1933,6 +1964,44 @@ class PostprocessService(OwnerDelegator):
                 )
         self._notify_offline_pending_changed(result["pending"])
         return result
+
+    def force_clear_offline_pending(
+            self,
+            pending_keys: Optional[Set[str]] = None,
+            reason: str = "",
+    ) -> int:
+        """v1.5.12 F4：强制将指定（或全部）待后处理记录出队。
+
+        用于清理因历史缺陷永久停留在「处理中」的僵尸记录：出队时写入
+        历史失败原因，避免其长期占用监控器与前端状态、且无法被停止。
+        :return: 实际清理条数
+        """
+        if not self._get_data:
+            return 0
+        keys = {str(key) for key in (pending_keys or set()) if str(key)}
+        removed = 0
+        with self._offline_pending_lock:
+            pending = self._get_data(self._OFFLINE_PENDING_KEY) or {}
+            if not pending:
+                return 0
+            targets = (keys & set(pending)) if keys else set(pending)
+            if not targets:
+                return 0
+            for key in targets:
+                item = pending.get(key) or {}
+                file_name = str(item.get("file_name") or key)
+                self._mark_offline_history_status(
+                    key,
+                    "失败",
+                    reason or "已手动清理：任务长期停留在后处理中，强制出队",
+                )
+                pending.pop(key, None)
+                removed += 1
+                logger.warning(f"强制清理待后处理记录：{file_name}")
+            self._save_offline_pending(pending)
+            pending_count = len(pending)
+        self._notify_offline_pending_changed(pending_count)
+        return removed
 
     def _recompute_expected_cloud_dir(
             self, item: Dict[str, Any], file_name: str

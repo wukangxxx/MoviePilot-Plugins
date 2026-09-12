@@ -302,9 +302,15 @@ class TestExpiredTaskEarlySweep(unittest.TestCase):
         self.assertIn("_OFFLINE_ED2K_HARD_LIMIT", snippet)
         self.assertIn("判定卡死退出（绝对兜底）", snippet)
 
-    def test_sweep_covers_ed2k_and_magnet_only(self):
+    def test_sweep_covers_all_task_types(self):
+        """v1.5.12 F3：早筛不得再按 task_type 过滤。
+
+        v1.5.11 只对 ed2k/magnet 生效，分享转存（share）在「文件被外部
+        流程接走」的场景下同样会无限复查（2026-09-12 实测：冬城猎凶
+        S01E08 卡 3 小时、check_index 恒为 0）。
+        """
         snippet = self._snippet()
-        self.assertIn(
+        self.assertNotIn(
             'if str(item.get("task_type") or "share") not in {"ed2k", "magnet"}:',
             snippet,
         )

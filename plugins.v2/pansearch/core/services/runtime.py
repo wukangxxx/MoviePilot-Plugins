@@ -755,6 +755,8 @@ class SyncRuntimeService(OwnerDelegator):
             if task.get("status") == "postprocessing":
                 stop_token = f"{task_id}:{time.time_ns()}"
                 task["postprocess_stop_token"] = stop_token
+                # v1.5.12 F1：记录停止起点，供监控器按租约回收失效的停止流程
+                task["postprocess_stop_started_at"] = time.time()
                 task_snapshot = dict(task)
             else:
                 task_snapshot = None
@@ -829,6 +831,83 @@ class SyncRuntimeService(OwnerDelegator):
     # 安全停止等待后处理原子提交的最长时间（秒）。超时后不再无限等待，
     # 直接移除未开始的持久任务并标记已停止，避免「停止不了」。
     _POSTPROCESS_STOP_WAIT_SECONDS = 30
+    # v1.5.12 F1：停止租约。stopping 状态会把 pending 从后处理队列中永久
+    # 剔除，而负责收尾的停止线程可能因网盘请求阻塞而永不返回，表现为
+    # 「后处理卡死 + 点停止也停不了」。超过该租约仍停留在 stopping，即
+    # 由监控器（每轮必跑）回收标记并强制终结任务。
+    _POSTPROCESS_STOP_LEASE_SECONDS = 120
+
+    @staticmethod
+    def _discard_postprocess_stop(
+            task: Optional[Dict[str, Any]], stop_token: str
+    ) -> None:
+        """v1.5.12 F1：丢弃已失效的停止标记，避免任务永久停在 stopping。
+
+        调用方必须已持有 _sync_tasks_lock（RLock）。
+        """
+        if not task:
+            return
+        if str(task.get("postprocess_stop_token") or "") != stop_token:
+            return
+        task.pop("postprocess_stop_token", None)
+        task.pop("postprocess_stop_pending_keys", None)
+        task.pop("postprocess_stop_started_at", None)
+        if task.get("status") == "stopping":
+            task.update({
+                "status": "postprocessing",
+                "phase": "文件后处理中",
+            })
+
+    def _collect_stopping_keys(self, now: Optional[float] = None) -> Set[str]:
+        """收集「正在安全停止」的 pending 键，并回收超期 stopping 任务。
+
+        v1.5.12 F1：原实现只按 status/stop_token 过滤，没有任何超时保护。
+        历史故障：停止线程卡在网盘请求上（daemon 线程、无日志、无超时），
+        任务永久停留在 stopping，其 pending_keys 被每轮剔除，于是该任务
+        既不会被处理、也不会被停止，前端永远显示「处理中」。
+        """
+        current_time = time.time() if now is None else now
+        stopping_keys: Set[str] = set()
+        expired_task_ids: List[str] = []
+        with self._sync_tasks_lock:
+            for task_id, task in self._sync_tasks.items():
+                if task.get("status") != "stopping" or not task.get(
+                        "postprocess_stop_token"
+                ):
+                    continue
+                started_at = float(task.get("postprocess_stop_started_at") or 0)
+                if started_at <= 0:
+                    task["postprocess_stop_started_at"] = current_time
+                    started_at = current_time
+                if (
+                        current_time - started_at
+                        < self._POSTPROCESS_STOP_LEASE_SECONDS
+                ):
+                    for pending_key in (
+                            task.get("postprocess_stop_pending_keys") or set()
+                    ):
+                        stopping_keys.add(str(pending_key))
+                    continue
+                expired_task_ids.append(task_id)
+            for task_id in expired_task_ids:
+                task = self._sync_tasks[task_id]
+                task.pop("postprocess_stop_token", None)
+                task.pop("postprocess_stop_pending_keys", None)
+                task.pop("postprocess_stop_started_at", None)
+                task.update({
+                    "status": "stopped",
+                    "phase": "文件后处理已停止（停止超时，已自动回收）",
+                    "progress": 100,
+                    "pending_count": 0,
+                    "finished_at": current_time,
+                })
+        if expired_task_ids:
+            logger.warning(
+                f"安全停止超过 {self._POSTPROCESS_STOP_LEASE_SECONDS}s 未完成，"
+                f"已自动回收 {len(expired_task_ids)} 个停止中的任务"
+            )
+            self._mark_runtime_changed()
+        return stopping_keys
 
     def _finish_postprocessing_stop(
             self,
@@ -860,6 +939,9 @@ class SyncRuntimeService(OwnerDelegator):
                         or str(current.get("postprocess_stop_token") or "")
                         != stop_token
                 ):
+                    # v1.5.12 F1：提前 return 前必须确保本 token 不再留存，
+                    # 否则 stopping 标记无人回收，任务永久卡在停止中。
+                    self._discard_postprocess_stop(current, stop_token)
                     return
             pending_keys = self._postprocessing_pending_keys(task_snapshot)
             removed = self._sync_handler.stop_pending_finalize_tasks(
@@ -872,6 +954,7 @@ class SyncRuntimeService(OwnerDelegator):
                         or str(current.get("postprocess_stop_token") or "")
                         != stop_token
                 ):
+                    self._discard_postprocess_stop(current, stop_token)
                     return
                 current.update({
                     "status": "stopped",
@@ -918,14 +1001,7 @@ class SyncRuntimeService(OwnerDelegator):
             force=bool(kwargs.get("force")),
             pending_keys=kwargs.get("pending_keys"),
         )
-        with self._sync_tasks_lock:
-            stopping_keys = {
-                str(pending_key)
-                for task in self._sync_tasks.values()
-                if task.get("status") == "stopping"
-                   and task.get("postprocess_stop_token")
-                for pending_key in task.get("postprocess_stop_pending_keys") or set()
-            }
+        stopping_keys = self._collect_stopping_keys()
         if stopping_keys:
             filtered_groups = []
             for group in groups:
@@ -1189,6 +1265,40 @@ class SyncRuntimeService(OwnerDelegator):
                 "restarted": restarted,
                 "restart_failed": restart_failed,
             },
+        }
+
+    def api_force_clear_offline_pending(
+            self,
+            apikey: str,
+            pending_keys: Optional[List[str]] = None,
+            reason: str = "",
+    ) -> dict:
+        """v1.5.12 F4：强制清理长期停留在「处理中」的后处理记录。
+
+        不传 pending_keys 时清空全部待后处理队列。用于从历史故障
+        （停止不了 / 永久后处理中）中一次性恢复。
+        """
+        if apikey != settings.API_TOKEN:
+            return {"success": False, "message": "API密钥错误"}
+        sync_handler = self._sync_handler
+        if not sync_handler:
+            return {"success": False, "message": "插件尚未初始化完成"}
+        try:
+            keys = (
+                {str(key) for key in pending_keys if str(key).strip()}
+                if pending_keys else None
+            )
+            removed = sync_handler.force_clear_offline_pending(
+                pending_keys=keys, reason=str(reason or "")
+            )
+        except Exception as error:
+            logger.error(f"强制清理待后处理记录失败：{error}")
+            return {"success": False, "message": str(error)}
+        self._mark_runtime_changed()
+        return {
+            "success": True,
+            "message": f"已强制清理 {removed} 个待后处理记录",
+            "data": {"removed": removed},
         }
 
     def api_delete_offline_task(

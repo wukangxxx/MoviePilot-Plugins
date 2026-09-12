@@ -4,7 +4,7 @@ import datetime
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Event as ThreadEvent, Lock, Thread
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import pytz
 from app.core.config import global_vars, settings

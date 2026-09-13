@@ -2,7 +2,7 @@
 UI配置模块
 负责生成插件的配置表单和详情页面
 """
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 from app.core.config import settings
 from app.db.subscribe_oper import SubscribeOper
 from app.schemas.types import MediaType
@@ -76,6 +76,51 @@ class UIConfig:
         }
 
     @staticmethod
+    def _status_card(title: str, rows: List[Dict[str, str]], atype: str = 'info') -> Dict[str, Any]:
+        """
+        生成一张只读状态卡片（label / value 两列）。
+
+        :param title: 卡片标题
+        :param rows: [{'label': ..., 'value': ...}, ...]
+        :param atype: 卡片配色 —— info / success / warning / error
+        """
+        items: List[Dict[str, Any]] = []
+        for item in rows:
+            label = str(item.get('label') or '')
+            value = str(item.get('value') or '—')
+            items.append({
+                'component': 'VCol',
+                'props': {'cols': 12, 'md': 4},
+                'content': [{
+                    'component': 'VSheet',
+                    'props': {'color': 'surface', 'rounded': 'lg', 'border': True, 'class': 'pa-3 h-100'},
+                    'content': [
+                        {'component': 'div', 'props': {'class': 'text-caption text-medium-emphasis'}, 'text': label},
+                        {'component': 'div', 'props': {'class': 'text-body-1 font-weight-medium mt-1'}, 'text': value},
+                    ]
+                }]
+            })
+        return {
+            'component': 'VRow',
+            'content': [{
+                'component': 'VCol',
+                'props': {'cols': 12},
+                'content': [{
+                    'component': 'VCard',
+                    'props': {'variant': 'tonal', 'color': atype, 'rounded': 'lg'},
+                    'content': [{
+                        'component': 'VCardText',
+                        'props': {'class': 'py-3'},
+                        'content': [
+                            {'component': 'div', 'props': {'class': 'text-subtitle-2 mb-2'}, 'text': title},
+                            {'component': 'VRow', 'content': items},
+                        ]
+                    }]
+                }]
+            }]
+        }
+
+    @staticmethod
     def _alert(text: str, atype: str = 'info') -> Dict[str, Any]:
         """生成一个整宽提示条。"""
         return {
@@ -100,7 +145,7 @@ class UIConfig:
         }
 
     @staticmethod
-    def get_form() -> Tuple[List[dict], Dict[str, Any]]:
+    def get_form(account_status: Optional[Dict[str, Any]] = None) -> Tuple[List[dict], Dict[str, Any]]:
         """
         获取插件配置表单
 
@@ -108,13 +153,28 @@ class UIConfig:
             主界面 = 插件基本功能配置 + 115网盘信息配置
             其下按「订阅 / 签到 / 盘搜 / 癫影 / 影巢 / 金山文档」分 Tab 管理
 
+        v1.8.2 新增：
+            account_status 传入后，在主界面顶部渲染「账户登录状态」卡片，
+            用于直观确认 115 网盘 / 癫影的登录态、积分与有效期。
+
+        :param account_status: 由插件实例采集的登录状态快照，可为 None
         :return: (表单schema, 默认配置)
         """
         subscribe_options = UIConfig.get_subscribe_options()
         site_name_items = UIConfig.get_site_name_options()
 
         # ============ 主界面：插件基本功能配置 ============
-        basic_rows: List[Dict[str, Any]] = [
+        basic_rows: List[Dict[str, Any]] = []
+
+        # 登录状态卡片（v1.8.2：115 网盘 + 癫影）
+        if account_status:
+            basic_rows.append(UIConfig._status_card(
+                str(account_status.get('title') or '账户登录状态'),
+                list(account_status.get('rows') or []),
+                str(account_status.get('type') or 'info'),
+            ))
+
+        basic_rows.extend([
             # 基本开关 + 执行周期
             {
                 'component': 'VRow',
@@ -155,7 +215,7 @@ class UIConfig:
                      'content': [{'component': 'VSwitch', 'props': {'model': 'skip_other_season_dirs', 'label': '多季剧集快速转存', 'hint': '跳过其他季目录以减少API调用，资源搜索不到时需要关闭', 'persistent-hint': True}}]}
                 ]
             }
-        ]
+        ])
 
         # ============ 主界面：115网盘信息配置 ============
         p115_rows: List[Dict[str, Any]] = [

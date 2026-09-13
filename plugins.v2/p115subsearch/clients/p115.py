@@ -238,21 +238,45 @@ class P115ClientManager:
 
     def check_login(self) -> bool:
         """检查登录状态"""
+        return bool(self.get_account_info().get("connected"))
+
+    def get_account_info(self) -> Dict[str, Any]:
+        """
+        读取 115 网盘账户信息（v1.8.2 新增，供配置页状态卡片展示）。
+
+        复用 user_my_info 接口，不额外增加请求；任何异常均降级为未连接，
+        不影响插件主流程。
+
+        :return: {"connected": bool, "name": str, "vip": bool, ...}
+        """
         if not self.client:
-            return False
+            return {"connected": False, "error": "115 客户端未初始化（Cookie 为空或依赖缺失）"}
 
         try:
             self.rate_limiter.wait()
             self._api_call_count += 1
             user_info = self.client.user_my_info()
-            if user_info.get("state"):
-                uname = user_info.get('data', {}).get('uname', '未知')
-                logger.info(f"115 登录成功: {uname}")
-                return True
-            return False
         except Exception as e:
             logger.error(f"检查 115 登录状态失败: {e}")
-            return False
+            return {"connected": False, "error": f"读取失败：{e}"}
+
+        if not isinstance(user_info, dict) or not user_info.get("state"):
+            message = (user_info or {}).get("error") if isinstance(user_info, dict) else None
+            return {"connected": False, "error": str(message or "Cookie 已失效或接口返回失败")}
+
+        data = user_info.get("data") or {}
+        uname = str(data.get("uname") or data.get("user_name") or "115 用户")
+        logger.info(f"115 登录成功: {uname}")
+        return {
+            "connected": True,
+            "name": uname,
+            "user_id": str(data.get("user_id") or ""),
+            "vip": bool(data.get("vip") or data.get("is_vip")),
+            "vip_name": str(data.get("vip_name") or ""),
+            "expire": bool(data.get("expire")),
+            "space_used": data.get("space_used"),
+            "space_total": data.get("space_total"),
+        }
 
     def get_pid_by_path(self, path: str, mkdir: bool = True) -> int:
         """

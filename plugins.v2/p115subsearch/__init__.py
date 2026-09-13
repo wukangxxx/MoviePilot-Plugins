@@ -3,6 +3,7 @@
 结合MoviePilot订阅功能，自动搜索115网盘资源并转存缺失剧集
 """
 import datetime
+import time
 from pathlib import Path
 from threading import Lock
 from typing import Optional, Any, List, Dict, Tuple
@@ -40,7 +41,7 @@ class P115SubSearch(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/cloud.png"
     # 插件版本
-    plugin_version = "1.8.1"
+    plugin_version = "1.8.2"
     # 插件作者
     plugin_author = "mrtian2016"
     # 作者主页
@@ -776,6 +777,10 @@ class P115SubSearch(_PluginBase):
             self._dian115_browser_proxy = (config.get("dian115_browser_proxy", "") or "").strip()
             self._dian115_login_cron = (config.get("dian115_login_cron", "") or "").strip()
             self._dian115_token = (config.get("dian115_token", "") or "").strip()
+            # 积分解锁配置（v1.8.2 修复：此前漏读，导致开关保存后被默认值覆盖，永远打不开）
+            self._dian115_auto_unlock = config.get("dian115_auto_unlock", False)
+            self._dian115_max_unlock_points = int(config.get("dian115_max_unlock_points", 50) or 50)
+            self._dian115_max_points_per_sub = int(config.get("dian115_max_points_per_sub", 20) or 20)
 
             # 签到配置（v1.8.0）
             self._checkin_enabled = config.get("checkin_enabled", False)
@@ -1355,7 +1360,141 @@ class P115SubSearch(_PluginBase):
         return self._enabled
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
-        return UIConfig.get_form()
+        return UIConfig.get_form(self._collect_account_status())
+
+    def _collect_account_status(self) -> Dict[str, Any]:
+        """
+        采集 115 网盘与癫影的登录状态，供配置页顶部状态卡片展示（v1.8.2 新增）。
+
+        设计要点：
+        - **只读本地状态，不发网络请求**。翻配置页是高频操作，绝不能触发
+          浏览器冷启动或第三方接口调用（否则配置页会被拖慢）。
+        - 任何异常都降级为「未知」，不允许影响配置表单渲染。
+        """
+        rows: List[Dict[str, str]] = []
+        level = "info"
+
+        # ---- 癫影（Dian115）----
+        try:
+            client = self._dian115_client
+            if client is None:
+                if not self._dian115_enabled and not self._dian115_checkin_enabled:
+                    rows.append({"label": "癫影", "value": "未启用"})
+                elif not self._dian115_email or not self._dian115_password:
+                    rows.append({"label": "癫影", "value": "缺少账号密码"})
+                    level = "warning"
+                else:
+                    rows.append({"label": "癫影", "value": "客户端未初始化"})
+                    level = "warning"
+            else:
+                status = client.login_status()
+                auth_mode = "未配置"
+                if status.get("has_token"):
+                    remain = status.get("token_remaining_hours")
+                    auth_mode = f"手工 Token（剩余约 {remain} 小时）" if remain else "手工 Token"
+                elif status.get("auto_login"):
+                    auth_mode = (
+                        "自动登录（浏览器可用）" if status.get("browser_available")
+                        else f"自动登录不可用：{status.get('browser_error') or '浏览器环境缺失'}"
+                    )
+                    if not status.get("browser_available"):
+                        level = "warning"
+                rows.append({"label": "癫影认证方式", "value": auth_mode})
+                rows.append({
+                    "label": "癫影账号",
+                    "value": str(status.get("email") or "未填写"),
+                })
+                rows.append({
+                    "label": "癫影积分解锁",
+                    "value": "已开启" if self._dian115_auto_unlock else "已关闭",
+                })
+        except Exception as error:  # 状态展示绝不能影响表单
+            logger.debug(f"采集癫影登录状态失败：{error}")
+            rows.append({"label": "癫影", "value": "状态读取失败"})
+
+        # ---- 115 网盘 ----
+        try:
+            manager = self._p115_manager
+            if manager is None:
+                rows.append({"label": "115 网盘", "value": "客户端未初始化"})
+                level = "warning"
+            elif not getattr(manager, "client", None):
+                has_cookie = bool((self._cookies or "").strip())
+                rows.append({
+                    "label": "115 网盘",
+                    "value": "未配置 Cookie" if not has_cookie else "客户端不可用（依赖缺失）",
+                })
+                level = "warning"
+            else:
+                # 只读本地 Cookie 快照，**不调用 get_account_info()**（那会发 HTTP 请求）。
+                # 配置页是高频入口，必须保持零网络开销。
+                raw_cookie = (self._cookies or "").strip()
+                cookie_keys = {
+                    key: bool(raw_cookie and f"{key}=" in raw_cookie)
+                    for key in ("UID", "CID", "SEID", "KID")
+                }
+                missing_keys = [k for k, ok in cookie_keys.items() if not ok]
+                cached = self.__read_p115_account_cache()
+                if cached and cached.get("connected"):
+                    rows.append({"label": "115 账号", "value": str(cached.get("name") or "已登录")})
+                    rows.append({
+                        "label": "会员状态",
+                        "value": str(cached.get("vip_name") or ("VIP" if cached.get("vip") else "普通用户")),
+                    })
+                    rows.append({"label": "状态更新时间", "value": str(cached.get("checked_at") or "—")})
+                elif missing_keys:
+                    rows.append({
+                        "label": "115 网盘",
+                        "value": f"Cookie 不完整，缺少：{'/'.join(missing_keys)}",
+                    })
+                    level = "error"
+                else:
+                    rows.append({"label": "115 网盘", "value": "Cookie 已配置（登录态待验证）"})
+        except Exception as error:
+            logger.debug(f"采集 115 登录状态失败：{error}")
+            rows.append({"label": "115 网盘", "value": "状态读取失败"})
+
+        # 有任一未就绪即降级配色，便于一眼发现问题
+        if level == "info" and any(
+                "未登录" in r["value"] or "未配置" in r["value"]
+                or "失败" in r["value"] or "不完整" in r["value"]
+                for r in rows
+        ):
+            level = "warning"
+
+        return {"title": "账户登录状态", "rows": rows, "type": level}
+
+    def __read_p115_account_cache(self) -> Dict[str, Any]:
+        """
+        读取上一次成功验证的 115 账户快照（纯本地缓存，零网络开销）。
+
+        v1.8.2 新增：由 check_login / 任务执行路径写入，供配置页展示。
+        """
+        try:
+            cached = self.get_data("p115_account_cache")
+            return cached if isinstance(cached, dict) else {}
+        except Exception:
+            return {}
+
+    def __cache_p115_account(self) -> None:
+        """
+        登录验证成功后落盘 115 账户快照，供配置页展示（v1.8.2 新增）。
+
+        仅在已经完成一次真实登录校验后调用，因此不会引入额外请求。
+        """
+        try:
+            info = self._p115_manager.get_account_info() if self._p115_manager else {}
+            if not isinstance(info, dict) or not info.get("connected"):
+                return
+            info = dict(info)
+            info["checked_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            # 只保留展示所需字段，避免把敏感信息写进配置快照
+            info.pop("space_used", None)
+            info.pop("space_total", None)
+            self.save_data("p115_account_cache", info)
+        except Exception as error:
+            logger.debug(f"缓存 115 账户快照失败：{error}")
+
 
     def get_page(self) -> Optional[List[dict]]:
         history = self.get_data('history') or []
@@ -1543,6 +1682,7 @@ class P115SubSearch(_PluginBase):
                 )
             return False
 
+        self.__cache_p115_account()
         logger.info("开始执行 115 网盘订阅同步...")
         if self._notify:
             self.post_message(

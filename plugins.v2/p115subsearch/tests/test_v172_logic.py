@@ -99,12 +99,15 @@ sys.modules['p115subsearch.clients'].HDHiveOpenAPIClient = object
 sys.modules['p115subsearch.clients'].HDHiveOpenAPIError = Exception
 sys.modules['p115subsearch.clients'].KDocsClient = object
 sys.modules['p115subsearch.clients'].KDocsError = Exception
+sys.modules['p115subsearch.clients'].Dian115Client = object
+sys.modules['p115subsearch.clients'].Dian115Error = Exception
 sys.modules['p115subsearch.handlers'].SearchHandler = lambda **k: types.SimpleNamespace()
 sys.modules['p115subsearch.handlers'].SyncHandler = lambda **k: types.SimpleNamespace()
 sys.modules['p115subsearch.handlers'].SubscribeHandler = lambda **k: types.SimpleNamespace(
     set_blocked_sites_only_115=lambda: [-1],
 )
 sys.modules['p115subsearch.handlers'].ApiHandler = lambda **k: types.SimpleNamespace()
+sys.modules['p115subsearch.handlers'].CheckinHandler = lambda **k: types.SimpleNamespace()
 sys.modules['p115subsearch.ui'].UIConfig = types.SimpleNamespace(get_form=lambda: ([], {}), get_page=lambda h: [])
 sys.modules['p115subsearch.utils'].download_so_file = lambda *a, **k: None
 
@@ -278,11 +281,11 @@ check("D4-1 屏蔽态且已[-1]时保持[-1]", MOCK_STORE.get('RssSites') == [-1
 check("D4-2 已有备份不被覆盖", p7._rss_sites_backup == ORIGINAL_RSS)
 
 # 版本断言
-check("V1 插件版本=1.7.2", P115SubSearch.plugin_version == "1.7.2", f"actual={P115SubSearch.plugin_version}")
+check("V1 插件版本=1.8.0", P115SubSearch.plugin_version == "1.8.0", f"actual={P115SubSearch.plugin_version}")
 import json
 pkg = json.loads((PLUGIN.parent.parent / 'package.v2.json').read_text(encoding='utf-8'))
-check("V2 package.v2.json 版本=v1.7.2", pkg['P115SubSearch']['version'] == 'v1.7.2')
-check("V3 package.v2.json 含 v1.7.2 history", 'v1.7.2' in pkg['P115SubSearch']['history'])
+check("V2 package.v2.json 版本=v1.8.0", pkg['P115SubSearch']['version'] == 'v1.8.0')
+check("V3 package.v2.json 含 v1.8.0 history", 'v1.8.0' in pkg['P115SubSearch']['history'])
 
 # ---------------- 结果 ----------------
 

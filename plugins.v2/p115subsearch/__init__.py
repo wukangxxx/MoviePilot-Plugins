@@ -21,8 +21,9 @@ from app.log import logger
 from app.plugins import _PluginBase
 from app.schemas.types import EventType, MediaType, NotificationType
 
-from .clients import PanSouClient, P115ClientManager, NullbrClient, HDHiveOpenAPIClient, HDHiveOpenAPIError, KDocsClient, KDocsError
-from .handlers import SearchHandler, SyncHandler, SubscribeHandler, ApiHandler
+from .clients import (PanSouClient, P115ClientManager, NullbrClient, HDHiveOpenAPIClient,
+                      HDHiveOpenAPIError, KDocsClient, KDocsError, Dian115Client, Dian115Error)
+from .handlers import SearchHandler, SyncHandler, SubscribeHandler, ApiHandler, CheckinHandler
 from .ui import UIConfig
 from .utils import download_so_file
 
@@ -39,7 +40,7 @@ class P115SubSearch(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/cloud.png"
     # 插件版本
-    plugin_version = "1.7.3"
+    plugin_version = "1.8.0"
     # 插件作者
     plugin_author = "mrtian2016"
     # 作者主页
@@ -52,6 +53,7 @@ class P115SubSearch(_PluginBase):
     # 私有变量
     _scheduler: Optional[BackgroundScheduler] = None
     _toggle_scheduler: Optional[BackgroundScheduler] = None  # 用于延迟切换/窗口切换
+    _checkin_scheduler: Optional[BackgroundScheduler] = None  # 签到独立周期（v1.8.0）
 
     # 配置属性
     _enabled: bool = False
@@ -112,6 +114,29 @@ class P115SubSearch(_PluginBase):
     _hdhive_max_unlock_points: int = 50
     _hdhive_max_points_per_sub: int = 20
 
+    # 癫影（Dian115）—— 搜索源 + 签到/转盘（v1.8.0）
+    _dian115_enabled: bool = False
+    _dian115_email: str = ""
+    _dian115_password: str = ""
+    # 浏览器登录后复制的 __Host-portal_token；站点已对账号密码登录开启人机验证，
+    # 这是唯一可行的认证方式（有效期约 24 小时）
+    _dian115_token: str = ""
+    # 积分解锁与预算（与 HDHive 同一套语义；默认关闭，不开就绝不扣分）
+    _dian115_auto_unlock: bool = False
+    _dian115_max_unlock_points: int = 50
+    _dian115_max_points_per_sub: int = 20
+
+    # 签到总控（v1.8.0）
+    _checkin_enabled: bool = False
+    _checkin_notify: bool = True
+    _checkin_onlyonce: bool = False
+    _checkin_cron: str = ""
+    _p115_checkin_enabled: bool = True
+    _dian115_checkin_enabled: bool = False
+    _dian115_checkin_mode: str = "normal"
+    _dian115_lottery_enabled: bool = False
+    _dian115_lottery_count: int = 0
+
     # 是否屏蔽系统订阅（True=已屏蔽系统订阅，False=已恢复系统订阅）
     _block_system_subscribe: bool = False
 
@@ -133,11 +158,13 @@ class P115SubSearch(_PluginBase):
     _p115_manager: Optional[P115ClientManager] = None
     _nullbr_client: Optional[NullbrClient] = None
     _hdhive_client: Optional[Any] = None
+    _dian115_client: Optional[Any] = None
 
     # 处理器
     _search_handler: Optional[SearchHandler] = None
     _subscribe_handler: Optional[SubscribeHandler] = None
     _sync_handler: Optional[SyncHandler] = None
+    _checkin_handler: Optional[CheckinHandler] = None
     _api_handler: Optional[ApiHandler] = None
 
     # v1.7.3 恢复 cron 最小间隔限制（v1.7.2 曾取消，阈值从 8 小时调整为 4 小时）
@@ -734,6 +761,24 @@ class P115SubSearch(_PluginBase):
             self._kdocs_cache_ttl_hours = int(config.get("kdocs_cache_ttl_hours", 6) or 6)
             self._kdocs_batch_rows = int(config.get("kdocs_batch_rows", 1000) or 1000)
             self._kdocs_cookie = config.get("kdocs_cookie", "") or ""
+
+            # 癫影（Dian115）配置（v1.8.0）
+            self._dian115_enabled = config.get("dian115_enabled", False)
+            self._dian115_email = (config.get("dian115_email", "") or "").strip()
+            self._dian115_password = config.get("dian115_password", "") or ""
+            self._dian115_token = (config.get("dian115_token", "") or "").strip()
+
+            # 签到配置（v1.8.0）
+            self._checkin_enabled = config.get("checkin_enabled", False)
+            self._checkin_notify = config.get("checkin_notify", True)
+            self._checkin_onlyonce = config.get("checkin_onlyonce", False)
+            self._checkin_cron = (config.get("checkin_cron", "") or "").strip()
+            self._p115_checkin_enabled = config.get("p115_checkin_enabled", True)
+            self._dian115_checkin_enabled = config.get("dian115_checkin_enabled", False)
+            self._dian115_checkin_mode = config.get("dian115_checkin_mode", "normal") or "normal"
+            self._dian115_lottery_enabled = config.get("dian115_lottery_enabled", False)
+            self._dian115_lottery_count = max(0, int(config.get("dian115_lottery_count", 0) or 0))
+
             self._max_transfer_per_sync = int(config.get("max_transfer_per_sync", 50) or 50)
             self._batch_size = int(config.get("batch_size", 20) or 20)
             self._skip_other_season_dirs = config.get("skip_other_season_dirs", True)
@@ -806,6 +851,25 @@ class P115SubSearch(_PluginBase):
             if self._onlyonce:
                 self._onlyonce = False
                 self.__update_config()
+
+        # 立即签到一次（v1.8.0）：独立于订阅搜索的「立即运行」，
+        # 因此放在 enabled/onlyonce 分支之外，单独按需创建调度器。
+        if self._checkin_onlyonce:
+            self._checkin_onlyonce = False
+            self.__update_config()
+            try:
+                if self._scheduler is None:
+                    self._scheduler = BackgroundScheduler(timezone=settings.TZ)
+                self._scheduler.add_job(
+                    func=self.run_checkin,
+                    trigger='date',
+                    run_date=datetime.datetime.now(tz=pytz.timezone(settings.TZ)) + datetime.timedelta(seconds=3),
+                    kwargs={"manual": True}
+                )
+                if self._scheduler.get_jobs() and not self._scheduler.running:
+                    self._scheduler.start()
+            except Exception as e:
+                logger.error(f"创建立即签到任务失败：{e}")
 
     # ------------------ init clients/handlers ------------------
 
@@ -880,6 +944,51 @@ class P115SubSearch(_PluginBase):
 
         if self._cookies:
             self._p115_manager = P115ClientManager(cookies=self._cookies)
+
+        # 癫影（Dian115）客户端：搜索源与签到共用同一实例（v1.8.0）
+        self._init_dian115_client(proxy)
+
+    def _init_dian115_client(self, proxy=None):
+        """初始化癫影（Dian115）客户端。
+
+        搜索与签到共用同一实例，登录态通过插件数据持久化复用。
+        未配置账号时不创建实例，避免无意义的握手开销。
+        """
+        self._dian115_client = None
+        need_dian115 = self._dian115_enabled or self._dian115_checkin_enabled
+        if not need_dian115:
+            return
+
+        if not self._dian115_token:
+            logger.warning(
+                "癫影已启用（搜索或签到）但未配置浏览器 Token；"
+                "站点已对账号密码登录开启人机验证，请在「癫影」页签粘贴 __Host-portal_token"
+            )
+            return
+
+        try:
+            self._dian115_client = Dian115Client(
+                email=self._dian115_email,
+                password=self._dian115_password,
+                token=self._dian115_token,
+                proxy=proxy,
+                get_data_func=self.get_data,
+                save_data_func=self.save_data
+            )
+        except Exception as exc:
+            logger.error(f"癫影客户端初始化失败: {exc.__class__.__name__} - {exc}")
+            self._dian115_client = None
+            return
+
+        if getattr(self._dian115_client, "error_type", None):
+            logger.warning(
+                f"癫影客户端缺少依赖 {self._dian115_client.error_type}，"
+                f"请在插件依赖中安装后重试"
+            )
+            self._dian115_client = None
+            return
+
+        logger.info("癫影（Dian115）客户端初始化成功")
 
     # ------------------ HDHive OpenAPI ------------------
 
@@ -974,7 +1083,12 @@ class P115SubSearch(_PluginBase):
             pansou_channels=self._pansou_channels,
             search_source_order=self._search_source_order,
             kdocs_client=self._kdocs_client,
-            kdocs_enabled=self._kdocs_enabled
+            kdocs_enabled=self._kdocs_enabled,
+            dian115_client=self._dian115_client,
+            dian115_enabled=self._dian115_enabled,
+            dian115_auto_unlock=self._dian115_auto_unlock,
+            dian115_max_unlock_points=self._dian115_max_unlock_points,
+            dian115_max_points_per_sub=self._dian115_max_points_per_sub
         )
         # 设置持久化函数，用于保存订阅的历史积分花费
         self._search_handler.set_data_funcs(self.get_data, self.save_data)
@@ -996,6 +1110,19 @@ class P115SubSearch(_PluginBase):
             pansou_client=self._pansou_client,
             pansou_check_enabled=self._pansou_check_enabled,
             max_transfer_links=self._max_transfer_links
+        )
+
+        self._checkin_handler = CheckinHandler(
+            p115_manager=self._p115_manager,
+            dian115_client=self._dian115_client,
+            p115_checkin_enabled=self._p115_checkin_enabled,
+            dian115_checkin_enabled=self._dian115_checkin_enabled,
+            dian115_checkin_mode=self._dian115_checkin_mode,
+            dian115_lottery_enabled=self._dian115_lottery_enabled,
+            dian115_lottery_count=self._dian115_lottery_count,
+            notify_func=self._notify_checkin,
+            get_data_func=self.get_data,
+            save_data_func=self.save_data
         )
 
         self._api_handler = ApiHandler(
@@ -1055,6 +1182,24 @@ class P115SubSearch(_PluginBase):
             "kdocs_cache_ttl_hours": self._kdocs_cache_ttl_hours,
             "kdocs_batch_rows": self._kdocs_batch_rows,
             "kdocs_cookie": self._kdocs_cookie,
+            # 癫影配置（v1.8.0）
+            "dian115_enabled": self._dian115_enabled,
+            "dian115_email": self._dian115_email,
+            "dian115_password": self._dian115_password,
+            "dian115_token": self._dian115_token,
+            "dian115_auto_unlock": self._dian115_auto_unlock,
+            "dian115_max_unlock_points": self._dian115_max_unlock_points,
+            "dian115_max_points_per_sub": self._dian115_max_points_per_sub,
+            # 签到配置（v1.8.0）
+            "checkin_enabled": self._checkin_enabled,
+            "checkin_notify": self._checkin_notify,
+            "checkin_onlyonce": self._checkin_onlyonce,
+            "checkin_cron": self._checkin_cron,
+            "p115_checkin_enabled": self._p115_checkin_enabled,
+            "dian115_checkin_enabled": self._dian115_checkin_enabled,
+            "dian115_checkin_mode": self._dian115_checkin_mode,
+            "dian115_lottery_enabled": self._dian115_lottery_enabled,
+            "dian115_lottery_count": self._dian115_lottery_count,
             # 其他配置
             "search_source_order": self._search_source_order,
             "subscribe_filter_mode": self._subscribe_filter_mode,
@@ -1072,6 +1217,57 @@ class P115SubSearch(_PluginBase):
             "rss_sites_backup": self._rss_sites_backup,
         })
 
+    # ------------------ 签到（v1.8.0） ------------------
+
+    def _notify_checkin(self, text: str) -> None:
+        """签到结果通知（受「签到通知」开关控制）。"""
+        if not self._checkin_notify:
+            return
+        try:
+            self.post_message(
+                mtype=NotificationType.Plugin,
+                title="【115网盘搜索助手】签到",
+                text=text
+            )
+        except Exception as e:
+            logger.warning(f"签到通知发送失败: {e}")
+
+    def run_checkin(self, providers: Optional[List[str]] = None, manual: bool = False) -> Dict[str, Any]:
+        """
+        执行一次签到
+
+        :param providers: 指定签到源（["p115"] / ["dian115"]）；为空时按配置自动判定
+        :param manual: 是否手动触发（手动触发不受 checkin_enabled 限制）
+        :return: CheckinHandler.run_checkin 的结果
+        """
+        empty = {"success": False, "total": 0, "success_count": 0, "fail_count": 0, "records": []}
+
+        if not manual and not self._checkin_enabled:
+            logger.info("签到未启用，跳过")
+            return empty
+
+        if not self._checkin_handler:
+            logger.warning("签到处理器未初始化，跳过签到")
+            return empty
+
+        try:
+            result = self._checkin_handler.run_checkin(providers)
+        except Exception as e:
+            logger.error(f"签到执行异常：{e}")
+            return empty
+
+        logger.info(
+            f"签到完成：成功 {result.get('success_count')} 项，失败 {result.get('fail_count')} 项"
+        )
+        return result
+
+    def checkin_service(self):
+        """签到服务入口（供 get_service 注册独立周期使用）。"""
+        try:
+            self.run_checkin()
+        except Exception as e:
+            logger.error(f"签到服务异常：{e}")
+
     # ------------------ stop ------------------
 
     def stop_service(self):
@@ -1079,7 +1275,8 @@ class P115SubSearch(_PluginBase):
             if self._scheduler:
                 self._scheduler.remove_all_jobs()
                 if self._scheduler.running:
-                    self._scheduler.shutdown()
+                    # wait=False：避免在自身 job 线程上 join() 自己导致永久冻结
+                    self._scheduler.shutdown(wait=False)
                 self._scheduler = None
         except Exception:
             pass
@@ -1088,8 +1285,17 @@ class P115SubSearch(_PluginBase):
             if self._toggle_scheduler:
                 self._toggle_scheduler.remove_all_jobs()
                 if self._toggle_scheduler.running:
-                    self._toggle_scheduler.shutdown()
+                    self._toggle_scheduler.shutdown(wait=False)
                 self._toggle_scheduler = None
+        except Exception:
+            pass
+
+        try:
+            if getattr(self, "_checkin_scheduler", None):
+                self._checkin_scheduler.remove_all_jobs()
+                if self._checkin_scheduler.running:
+                    self._checkin_scheduler.shutdown(wait=False)
+                self._checkin_scheduler = None
         except Exception:
             pass
 
@@ -1137,11 +1343,36 @@ class P115SubSearch(_PluginBase):
         }]
 
 
-    def get_service(self) -> List[Dict[str, Any]]:
-        if not self._enabled:
+    def _build_checkin_service(self) -> List[Dict[str, Any]]:
+        """构建签到服务；未配置独立周期时返回空列表（此时跟随主周期执行）。"""
+        if not self._checkin_enabled:
+            return []
+        if not self._checkin_cron:
+            logger.info("签到未配置独立周期，将跟随主周期执行")
             return []
 
+        try:
+            trigger = CronTrigger.from_crontab(self._checkin_cron)
+        except Exception as e:
+            logger.warning(f"签到 Cron 表达式无效：{self._checkin_cron}，本次不注册签到服务。错误：{e}")
+            return []
+
+        return [{
+            "id": "P115SubSearchCheckin",
+            "name": "115网盘签到服务",
+            "trigger": trigger,
+            "func": self.checkin_service,
+            "kwargs": {}
+        }]
+
+    def get_service(self) -> List[Dict[str, Any]]:
         services = []
+
+        # 签到服务独立于订阅搜索主开关：只要启用签到就注册（v1.8.0）
+        services.extend(self._build_checkin_service())
+
+        if not self._enabled:
+            return services
 
         # v1.7.3 恢复注册时最小间隔校验（双保险：init_plugin 已校验，此处防止
         # 运行中配置被外部改动导致过密触发）；不满足时回退 4 小时周期
@@ -1337,7 +1568,14 @@ class P115SubSearch(_PluginBase):
                 logger.error(f"同步任务异常：{e}")
                 success = False
             finally:
-                # 仅在用户开启了���蔽系统订阅时，才执行自动窗口切换逻辑
+                # 签到：未配置独立周期时跟随主周期执行（v1.8.0）
+                if self._checkin_enabled and not self._checkin_cron:
+                    try:
+                        self.run_checkin()
+                    except Exception as e:
+                        logger.error(f"跟随主周期签到失败：{e}")
+
+                # 仅在用户开启了屏蔽系统订阅时，才执行自动窗口切换逻辑
                 if success and self._block_system_subscribe and self._is_last_run_today(run_start):
                     if int(self._unblock_delay_minutes) < 0 or (not self._window_enabled()):
                         self._enter_blocked(reason="触发条件1")

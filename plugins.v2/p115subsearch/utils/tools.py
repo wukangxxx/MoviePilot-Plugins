@@ -504,3 +504,60 @@ def convert_hdhive_to_pansou_format(hdhive_resources: List[Any]) -> List[Dict]:
                 "update_time": ""
             })
     return converted
+
+
+class SimpleTTLCache:
+    """极简线程安全 TTL 缓存。
+
+    v1.8.0 新增，用于 Dian115 已解锁链接的幂等复用：
+    同一轮同步任务内，同一个分享不允许被重复解锁扣分。
+
+    刻意不引入 MoviePilot 内部的缓存组件，保证插件可独立测试。
+    """
+
+    def __init__(self, ttl: int = 3600, maxsize: int = 512):
+        import threading
+        import time
+        self._ttl = max(1, int(ttl or 3600))
+        self._maxsize = max(1, int(maxsize or 512))
+        self._lock = threading.RLock()
+        self._store: Dict[str, Tuple[float, Any]] = {}
+        self._time = time.monotonic
+
+    def _purge_locked(self) -> None:
+        now = self._time()
+        expired = [k for k, (ts, _) in self._store.items() if now - ts >= self._ttl]
+        for key in expired:
+            self._store.pop(key, None)
+
+    def get(self, key: Any, default: Any = None) -> Any:
+        with self._lock:
+            item = self._store.get(str(key))
+            if not item:
+                return default
+            ts, value = item
+            if self._time() - ts >= self._ttl:
+                self._store.pop(str(key), None)
+                return default
+            return value
+
+    def set(self, key: Any, value: Any) -> None:
+        with self._lock:
+            self._purge_locked()
+            if len(self._store) >= self._maxsize:
+                oldest = min(self._store.items(), key=lambda kv: kv[1][0])[0]
+                self._store.pop(oldest, None)
+            self._store[str(key)] = (self._time(), value)
+
+    def pop(self, key: Any, default: Any = None) -> Any:
+        with self._lock:
+            item = self._store.pop(str(key), None)
+            return item[1] if item else default
+
+    def clear(self) -> None:
+        with self._lock:
+            self._store.clear()
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._store)

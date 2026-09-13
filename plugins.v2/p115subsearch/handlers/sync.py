@@ -143,6 +143,52 @@ class SyncHandler:
             logger.warning(f"PanSou 链接有效性检测异常，降级为原有校验流程: {e}")
         return ""
 
+    def _unlock_pending_resource(self, resource: Dict[str, Any], resource_title: str) -> str:
+        """
+        统一处理「延迟解锁」资源（v1.8.0）
+
+        两类来源共用同一条按需扣分链路：
+          * HDHive：资源带 slug
+          * Dian115：资源带 share_id / resource_ref
+
+        :param resource: 搜索结果条目（need_unlock=True）
+        :param resource_title: 资源标题（仅用于日志）
+        :return: 解锁后得到的 115 分享链接；失败返回空字符串
+        """
+        if not isinstance(resource, dict):
+            return ""
+        owner = str(resource.get("_source") or "")
+        slug = str(resource.get("slug") or "")
+        share_id = int(resource.get("share_id") or resource.get("resource_ref") or 0)
+        unlock_points = int(resource.get("unlock_points") or 0)
+
+        # 优先判定业务归属：显式 _source 优先，其次按字段特征推断
+        is_dian115 = owner == "dian115" or (owner == "" and not slug and share_id > 0)
+        if is_dian115:
+            if share_id <= 0:
+                logger.error(f"Dian115 待解锁资源缺少分享 ID，跳过: {resource_title}")
+                return ""
+            logger.info(
+                f"遇到需要积分解锁的 Dian115 资源 {resource_title} "
+                f"(share_id: {share_id}, 预估 {unlock_points} 积分)，尝试解锁..."
+            )
+            unlocked_url = self._search_handler.unlock_dian115_resource(share_id, unlock_points)
+            if not unlocked_url:
+                logger.error(f"未能解锁 Dian115 资源: {resource_title}")
+                return ""
+            return unlocked_url
+
+        if slug:
+            logger.info(f"遇到需要解锁的 HDHive 收费资源 {resource_title} (slug: {slug})，尝试消耗积分解锁...")
+            unlocked_url = self._search_handler.unlock_hdhive_resource(slug, unlock_points)
+            if not unlocked_url:
+                logger.error(f"未能解锁 HDHive 收费资源: {resource_title}")
+                return ""
+            return unlocked_url
+
+        logger.error(f"待解锁资源既无 slug 也无 share_id，无法处理: {resource_title}")
+        return ""
+
     def process_movie_subscribe(
         self,
         subscribe,
@@ -166,6 +212,8 @@ class SyncHandler:
             sub_key = f"tmdb_{subscribe.tmdbid}_movie" if subscribe.tmdbid else f"{subscribe.name}_movie"
             if hasattr(self._search_handler, 'reset_sub_spent_points'):
                 self._search_handler.reset_sub_spent_points(sub_key)
+            if hasattr(self._search_handler, 'reset_dian115_sub_spent_points'):
+                self._search_handler.reset_dian115_sub_spent_points(sub_key)
 
             # 检查历史记录是否已成功转存
             movie_history_score = -1  # -1 表示未转存过
@@ -274,19 +322,15 @@ class SyncHandler:
                     if _pwd and share_url and "password=" not in share_url:
                         share_url = f"{share_url}?password={_pwd}"
 
-                    # 检查是否是刚搜索出尚未真正解锁的延期解锁 HDHive 资源
+                    # 检查是否是刚搜索出尚未真正解锁的延期解锁资源（HDHive / Dian115）
                     if resource.get("need_unlock") and not share_url:
-                        slug = resource.get("slug")
-                        if slug:
-                            logger.info(f"遇到需要解锁的收费资源 {resource_title} (slug: {slug})，尝试消耗积分解锁...")
-                            unlocked_url = self._search_handler.unlock_hdhive_resource(slug, resource.get("unlock_points", 0))
-                            if not unlocked_url:
-                                logger.error(f"未能解锁收费资源: {resource_title}")
-                                continue
-                            share_url = unlocked_url
-                            # 更新当前字典以便历史存入或下次能沿用这个 url
-                            resource["url"] = share_url
-                            resource["need_unlock"] = False
+                        unlocked_url = self._unlock_pending_resource(resource, resource_title)
+                        if not unlocked_url:
+                            continue
+                        share_url = unlocked_url
+                        # 更新当前字典以便历史存入或下次能沿用这个 url
+                        resource["url"] = share_url
+                        resource["need_unlock"] = False
 
                     if not share_url:
                         continue
@@ -415,6 +459,8 @@ class SyncHandler:
                                 # 订阅完成，清除该订阅的历史积分记录
                                 if hasattr(self._search_handler, 'clear_sub_points'):
                                     self._search_handler.clear_sub_points(sub_key)
+                                if hasattr(self._search_handler, 'clear_dian115_sub_points'):
+                                    self._search_handler.clear_dian115_sub_points(sub_key)
                             else:
                                 logger.error(f"转存失败：{mediainfo.title}")
 
@@ -471,6 +517,8 @@ class SyncHandler:
             sub_key = f"tmdb_{subscribe.tmdbid}_S{subscribe.season or 1}" if subscribe.tmdbid else f"{subscribe.name}_S{subscribe.season or 1}"
             if hasattr(self._search_handler, 'reset_sub_spent_points'):
                 self._search_handler.reset_sub_spent_points(sub_key)
+            if hasattr(self._search_handler, 'reset_dian115_sub_spent_points'):
+                self._search_handler.reset_dian115_sub_spent_points(sub_key)
 
             # 早期检查：如果订阅显示没有缺失集数，跳过处理
             if subscribe.lack_episode == 0:
@@ -526,6 +574,8 @@ class SyncHandler:
                 # 订阅已完整，清除历史积分记录
                 if hasattr(self._search_handler, 'clear_sub_points'):
                     self._search_handler.clear_sub_points(sub_key)
+                if hasattr(self._search_handler, 'clear_dian115_sub_points'):
+                    self._search_handler.clear_dian115_sub_points(sub_key)
                 return transferred_count
 
             # 获取缺失的集数列表
@@ -621,6 +671,8 @@ class SyncHandler:
                     # 缺失集数已全部补齐，清除历史积分记录
                     if hasattr(self._search_handler, 'clear_sub_points'):
                         self._search_handler.clear_sub_points(sub_key)
+                    if hasattr(self._search_handler, 'clear_dian115_sub_points'):
+                        self._search_handler.clear_dian115_sub_points(sub_key)
                 return transferred_count
 
             # 过滤掉尚未播出的剧集，避免浪费搜索和解锁资源
@@ -736,19 +788,15 @@ class SyncHandler:
                     if _pwd and share_url and "password=" not in share_url:
                         share_url = f"{share_url}?password={_pwd}"
 
-                    # 检查是否是刚搜索出尚未真正解锁的延期解锁 HDHive 资源
+                    # 检查是否是刚搜索出尚未真正解锁的延期解锁资源（HDHive / Dian115）
                     if resource.get("need_unlock") and not share_url:
-                        slug = resource.get("slug")
-                        if slug:
-                            logger.info(f"遇到需要解锁的收费资源 {resource_title} (slug: {slug})，尝试消耗积分解锁...")
-                            unlocked_url = self._search_handler.unlock_hdhive_resource(slug, resource.get("unlock_points", 0))
-                            if not unlocked_url:
-                                logger.error(f"未能解锁收费资源: {resource_title}")
-                                continue
-                            share_url = unlocked_url
-                            # 更新当前字典以便存入历史或记录这个 url
-                            resource["url"] = share_url
-                            resource["need_unlock"] = False
+                        unlocked_url = self._unlock_pending_resource(resource, resource_title)
+                        if not unlocked_url:
+                            continue
+                        share_url = unlocked_url
+                        # 更新当前字典以便存入历史或记录这个 url
+                        resource["url"] = share_url
+                        resource["need_unlock"] = False
 
                     if not share_url:
                         continue
@@ -976,6 +1024,8 @@ class SyncHandler:
                     if not (expected - downloaded):
                         if hasattr(self._search_handler, 'clear_sub_points'):
                             self._search_handler.clear_sub_points(sub_key)
+                        if hasattr(self._search_handler, 'clear_dian115_sub_points'):
+                            self._search_handler.clear_dian115_sub_points(sub_key)
 
         except Exception as e:
             logger.error(f"处理订阅 {subscribe.name} 出错：{str(e)}")

@@ -1,6 +1,10 @@
 """
 搜索处理模块
-负责所有搜索相关逻辑：HDHive、Nullbr、PanSou、KDocs
+负责所有搜索相关逻辑：Dian115、PanSou、KDocs、HDHive
+
+v1.8.0 起：
+    * 新增 Dian115（癫影）搜索源，仅返回 115 分享链接；
+    * Nullbr / HDHive 站点已失效，从可用搜索源中剔除（配置项保留但不再参与调度）。
 """
 from typing import Optional, List, Dict, Any
 
@@ -9,7 +13,7 @@ from app.log import logger
 from app.schemas import MediaInfo
 from app.schemas.types import MediaType
 
-from ..utils import convert_nullbr_to_pansou_format
+from ..utils import convert_nullbr_to_pansou_format, SimpleTTLCache
 
 
 class SearchHandler:
@@ -34,17 +38,22 @@ class SearchHandler:
         pansou_channels: str = "",
         search_source_order: Optional[List[str]] = None,
         kdocs_client=None,
-        kdocs_enabled: bool = False
+        kdocs_enabled: bool = False,
+        dian115_client=None,
+        dian115_enabled: bool = False,
+        dian115_auto_unlock: bool = False,
+        dian115_max_unlock_points: int = 50,
+        dian115_max_points_per_sub: int = 20
     ):
         """
         初始化搜索处理器
 
         :param pansou_client: PanSou 客户端实例
-        :param nullbr_client: Nullbr 客户端实例
-        :param hdhive_client: HDHive OpenAPI 客户端实例（API 模式使用）
+        :param nullbr_client: Nullbr 客户端实例（站点已失效，不再参与调度）
+        :param hdhive_client: HDHive OpenAPI 客户端实例（API 模式使用，站点已失效）
         :param pansou_enabled: 是否启用 PanSou
-        :param nullbr_enabled: 是否启用 Nullbr
-        :param hdhive_enabled: 是否启用 HDHive
+        :param nullbr_enabled: 是否启用 Nullbr（已失效，保留兼容）
+        :param hdhive_enabled: 是否启用 HDHive（已失效，保留兼容）
         :param hdhive_username: HDHive 用户名
         :param hdhive_password: HDHive 密码
         :param hdhive_cookie: HDHive Cookie
@@ -56,6 +65,11 @@ class SearchHandler:
                                     为空时使用默认优先级 Nullbr > HDHive > PanSou
         :param kdocs_client: KDocs 在线文档库客户端实例
         :param kdocs_enabled: 是否启用 KDocs 在线文档库
+        :param dian115_client: Dian115（癫影）客户端实例
+        :param dian115_enabled: 是否启用 Dian115 搜索源
+        :param dian115_auto_unlock: 是否自动消耗积分解锁 Dian115 资源
+        :param dian115_max_unlock_points: 单次任务 Dian115 积分解锁总预算
+        :param dian115_max_points_per_sub: 单个订阅 Dian115 积分解锁预算
         """
         self._pansou_client = pansou_client
         self._nullbr_client = nullbr_client
@@ -80,6 +94,16 @@ class SearchHandler:
         self._search_source_order = search_source_order or []
         self._kdocs_client = kdocs_client
         self._kdocs_enabled = kdocs_enabled
+        self._dian115_client = dian115_client
+        self._dian115_enabled = dian115_enabled
+        self._dian115_auto_unlock = dian115_auto_unlock
+        self._dian115_max_unlock_points = dian115_max_unlock_points
+        self._dian115_max_points_per_sub = dian115_max_points_per_sub
+        # Dian115 的积分账本与 HDHive 相互独立，避免两个渠道互相挤占预算
+        self._dian115_spent_points = 0
+        self._dian115_sub_spent_points = 0
+        # 已解锁链接幂等缓存：同一分享在同一 TTL 内只扣一次分
+        self._dian115_unlocked_cache = SimpleTTLCache(ttl=3600, maxsize=512)
 
     def get_enabled_sources(self) -> List[str]:
         """
@@ -89,23 +113,27 @@ class SearchHandler:
         优先级规则：
         1. 用户配置了自定义优先级（search_source_order）时按其顺序排列；
            未出现在自定义列表中的已启用源按默认顺序追加在末尾
-        2. 未配置时使用默认优先级 Nullbr > HDHive > PanSou
+        2. 未配置时使用默认优先级 Dian115 > PanSou > KDocs
+
+        v1.8.0：Nullbr 与 HDHive 站点已停止服务，**硬屏蔽**（即使配置里仍勾选
+        也不参与调度，避免订阅流程白白等待超时）。其配置项保留仅作兼容。
 
         :return: 搜索源名称列表
         """
         # 按默认优先级收集已启用且可用的源
         available = []
 
-        # Nullbr
-        if self._nullbr_enabled and self._nullbr_client:
-            available.append("nullbr")
+        # Nullbr —— 站点已失效，永久剔除
+        # if self._nullbr_enabled and self._nullbr_client:
+        #     available.append("nullbr")
 
-        # HDHive
-        if self._hdhive_enabled:
-            if self._hdhive_query_mode == "playwright" and self._hdhive_username and self._hdhive_password:
-                available.append("hdhive")
-            elif self._hdhive_query_mode == "api" and self._hdhive_client and self._hdhive_client.is_ready:
-                available.append("hdhive")
+        # HDHive —— 站点已失效，永久剔除
+        # if self._hdhive_enabled:
+        #     available.append("hdhive")
+
+        # Dian115（癫影）
+        if self._dian115_enabled and self._dian115_client:
+            available.append("dian115")
 
         # PanSou
         if self._pansou_enabled and self._pansou_client:
@@ -169,17 +197,15 @@ class SearchHandler:
         """
         使用指定的单一搜索源查询资源
 
-        :param source: 搜索源名称 ("nullbr", "hdhive", "pansou", "kdocs")
+        :param source: 搜索源名称 ("dian115", "pansou", "kdocs")
         :param mediainfo: 媒体信息
         :param media_type: 媒体类型
         :param season: 季号（电视剧时使用）
         :param tag_source: 是否给每个结果打上 _source 渠道标签（渠道级回退统计用）
         :return: 115网盘资源列表
         """
-        if source == "nullbr":
-            results = self._search_nullbr(mediainfo, media_type, season)
-        elif source == "hdhive":
-            results = self._search_hdhive(mediainfo, media_type, season)
+        if source == "dian115":
+            results = self._search_dian115(mediainfo, media_type, season)
         elif source == "pansou":
             if media_type == MediaType.MOVIE:
                 results = self._search_pansou_movie(mediainfo)
@@ -196,6 +222,205 @@ class SearchHandler:
                 if isinstance(item, dict):
                     item.setdefault("_source", source)
         return results or []
+
+    def _search_dian115(
+        self,
+        mediainfo: MediaInfo,
+        media_type: MediaType,
+        season: Optional[int] = None
+    ) -> List[Dict]:
+        """
+        使用 Dian115（癫影）按 TMDB ID 查询资源
+
+        Dian115 是按 TMDB 维度组织资源的，因此必须要有 TMDB ID。
+        客户端内部已完成「只保留 115 分享链接」过滤，这里无需二次过滤。
+
+        :param mediainfo: 媒体信息
+        :param media_type: 媒体类型（MOVIE 或 TV）
+        :param season: 季号（电视剧时使用）
+        :return: 115网盘资源列表（统一格式）
+        """
+        if not self._dian115_client:
+            logger.warning("Dian115 客户端未初始化，跳过 Dian115 查询")
+            return []
+
+        if not getattr(self._dian115_client, "is_configured", False):
+            logger.warning("Dian115 未配置认证信息，跳过 Dian115 查询")
+            return []
+
+        if not mediainfo.tmdb_id:
+            logger.warning(f"{mediainfo.title} 缺少 TMDB ID，无法使用 Dian115 查询")
+            return []
+
+        dian_media_type = "movie" if media_type == MediaType.MOVIE else "tv"
+        dian_season = int(season or 0) if dian_media_type == "tv" else 0
+        label = (
+            mediainfo.title if media_type == MediaType.MOVIE
+            else f"{mediainfo.title} S{season}"
+        )
+        logger.info(f"使用 Dian115 查询资源: {label} (TMDB ID: {mediainfo.tmdb_id})")
+
+        try:
+            results = self._dian115_client.search_resources(
+                tmdb_id=mediainfo.tmdb_id,
+                media_type=dian_media_type,
+                season=dian_season,
+                limit=20
+            )
+        except Exception as e:
+            logger.error(f"Dian115 查询 {label} 失败: {e}")
+            return []
+
+        if not results:
+            logger.info("Dian115 未找到资源")
+            return []
+
+        # 两级预算过滤（与 HDHive 同一套语义）：
+        #   * 单条解锁成本高于任一预算上限的，直接丢弃（无论如何都解锁不了）
+        #   * 免费 / 已解锁条目直接采用
+        #   * 收费条目：开启自动解锁时标记为待解锁，交给 SyncHandler 按需真正扣分
+        #   * 收费条目且未开自动解锁：丢弃并计数
+        selected: List[Dict] = []
+        skipped_over_budget = 0
+        skipped_need_unlock = 0
+        for resource in results:
+            unlock_points = int(resource.get("unlock_points") or 0)
+            if unlock_points > 0:
+                if unlock_points > self._dian115_max_points_per_sub:
+                    skipped_over_budget += 1
+                    continue
+                if unlock_points > self._dian115_max_unlock_points:
+                    skipped_over_budget += 1
+                    continue
+                if not self._dian115_auto_unlock:
+                    skipped_need_unlock += 1
+                    continue
+                resource["need_unlock"] = True
+            selected.append(resource)
+
+        free_count = sum(1 for item in selected if not item.get("need_unlock"))
+        unlock_count = len(selected) - free_count
+        logger.info(
+            f"Dian115 共得到 {len(selected)} 个 115 资源"
+            f"（免费/已解锁: {free_count}, 待积分解锁: {unlock_count}）；"
+            f"跳过（未开自动解锁: {skipped_need_unlock}, 超出预算: {skipped_over_budget}）"
+        )
+        return selected
+
+    def unlock_dian115_resource(self, share_id: int, unlock_points: int) -> Optional[str]:
+        """
+        供 SyncHandler 调用的 Dian115 手动解锁（扣积分）API
+
+        与 HDHive 一致采用两级预算：单次任务总预算 + 单订阅预算；
+        服务端实际扣分与预估不一致时以服务端为准入账。
+
+        :param share_id: Dian115 分享 ID（资源条目的 resource_ref）
+        :param unlock_points: 搜索阶段给出的预估积分
+        :return: 成功返回真实的 115 分享链接，失败返回 None
+        """
+        if not self._dian115_client:
+            logger.warning("Dian115 客户端未初始化，无法解锁")
+            return None
+
+        normalized_share_id = int(share_id or 0)
+        if normalized_share_id <= 0:
+            logger.warning("Dian115 解锁失败：分享 ID 无效")
+            return None
+
+        # 复用已解锁缓存，避免同一轮任务内重复扣分
+        cached = self._dian115_unlocked_cache.get(str(normalized_share_id))
+        if cached:
+            logger.info(f"Dian115 复用本任务已解锁链接: share_id={normalized_share_id}")
+            return str(cached)
+
+        estimate = max(0, int(unlock_points or 0))
+        if (self._dian115_spent_points + estimate) > self._dian115_max_unlock_points:
+            logger.warning(
+                f"Dian115 全局积分预算不足：已花费 {self._dian115_spent_points}，"
+                f"需 {estimate}，任务总预算 {self._dian115_max_unlock_points}"
+            )
+            return None
+        if (self._dian115_sub_spent_points + estimate) > self._dian115_max_points_per_sub:
+            logger.warning(
+                f"Dian115 单订阅积分预算不足：本订阅已花费 {self._dian115_sub_spent_points}，"
+                f"需 {estimate}，单订阅预算 {self._dian115_max_points_per_sub}"
+            )
+            return None
+
+        logger.info(f"Dian115 触发按需积分解锁: share_id={normalized_share_id}，预估 {estimate} 积分")
+        try:
+            payload = self._dian115_client.unlock_share(normalized_share_id)
+        except Exception as e:
+            code = str(getattr(e, "code", "") or "")
+            if code in ("turnstile_failed", "turnstile_required"):
+                logger.warning(
+                    f"Dian115 解锁需要 Cloudflare 人机验证（{code}），本次跳过且未扣积分。"
+                    f"如需使用癫影资源，请在浏览器完成验证后改用其它方案；"
+                    f"当前建议以「签到/转盘」为主、搜索走盘搜。"
+                )
+            else:
+                logger.error(f"Dian115 解锁 {normalized_share_id} 失败：{e}")
+            return None
+
+        share_url = self._dian115_extract_unlock_url(payload)
+        if not share_url:
+            logger.error(f"Dian115 解锁响应未返回可用链接：share_id={normalized_share_id}")
+            return None
+
+        actual_points = max(0, int(payload.get("actual_points") or estimate))
+        self._dian115_spent_points += actual_points
+        self._dian115_sub_spent_points += actual_points
+        self._dian115_unlocked_cache.set(str(normalized_share_id), share_url)
+        if self._current_sub_key:
+            history = self._load_sub_points_history()
+            history[f"dian115:{self._current_sub_key}"] = self._dian115_sub_spent_points
+            self._save_sub_points_history(history)
+        logger.info(
+            f"Dian115 解锁成功，扣除 {actual_points} 积分，链接: {share_url}。"
+            f"任务剩余 {max(0, self._dian115_max_unlock_points - self._dian115_spent_points)}，"
+            f"订阅剩余 {max(0, self._dian115_max_points_per_sub - self._dian115_sub_spent_points)}"
+        )
+        return share_url
+
+    @staticmethod
+    def _dian115_extract_unlock_url(payload: Dict) -> str:
+        """从解锁响应中取出 115 分享链接（响应结构随版本变化，做多重兼容）。"""
+        if not isinstance(payload, dict):
+            return ""
+        data = payload.get("payload")
+        if not isinstance(data, dict):
+            data = payload
+        for key in ("url", "share_url", "full_url", "link"):
+            value = str(data.get(key) or "").strip()
+            if value:
+                return value
+        share_code = str(data.get("share_code") or "").strip()
+        if share_code:
+            receive_code = str(data.get("receive_code") or "").strip()
+            return (
+                f"https://115.com/s/{share_code}?password={receive_code}"
+                if receive_code else f"https://115.com/s/{share_code}"
+            )
+        return ""
+
+    def reset_dian115_sub_spent_points(self, sub_key: str = ""):
+        """供 SyncHandler 在处理每个新订阅前调用，载入该订阅的历史积分花费。"""
+        if sub_key:
+            history = self._load_sub_points_history()
+            self._dian115_sub_spent_points = max(
+                0, int(history.get(f"dian115:{sub_key}") or 0)
+            )
+        else:
+            self._dian115_sub_spent_points = 0
+
+    def clear_dian115_sub_points(self, sub_key: str):
+        """订阅完成后清除该订阅的 Dian115 历史积分记录。"""
+        history = self._load_sub_points_history()
+        key = f"dian115:{sub_key}"
+        if key in history:
+            del history[key]
+            self._save_sub_points_history(history)
+            logger.info(f"Dian115 已清除订阅 {sub_key} 的历史积分记录")
 
     def _pansou_search(self, keyword: str) -> List[Dict]:
         """

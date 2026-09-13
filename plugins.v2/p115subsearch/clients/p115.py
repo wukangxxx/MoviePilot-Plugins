@@ -947,3 +947,81 @@ class P115ClientManager:
     def reset_api_call_count(self):
         """重置 API 调用计数器"""
         self._api_call_count = 0
+
+    # ------------------ 每日签到（v1.8.0） ------------------
+
+    def points_sign_status(self) -> Dict[str, Any]:
+        """查询今日签到状态。
+
+        :return: {"success": bool, "signed": bool, "days": int, "message": str}
+        """
+        if not self.client:
+            return {"success": False, "signed": False, "days": 0, "message": "115 客户端未初始化"}
+
+        try:
+            self.rate_limiter.wait()
+            self._api_call_count += 1
+            status = self.client.user_points_sign()
+        except Exception as e:
+            logger.error(f"查询 115 签到状态失败: {e}")
+            return {"success": False, "signed": False, "days": 0, "message": f"查询失败：{e}"}
+
+        if not isinstance(status, dict) or not status.get("state"):
+            message = (status or {}).get("error", "接口返回失败") if isinstance(status, dict) else "接口返回失败"
+            return {"success": False, "signed": False, "days": 0, "message": str(message)}
+
+        data = status.get("data") or {}
+        return {
+            "success": True,
+            "signed": int(data.get("is_sign_today") or 0) == 1,
+            "days": int(data.get("continuous_day") or 0),
+            "message": "今日已签到" if int(data.get("is_sign_today") or 0) == 1 else "今日未签到"
+        }
+
+    def points_sign(self) -> Dict[str, Any]:
+        """执行 115 每日签到并领取枫叶。
+
+        :return: {"success": bool, "already": bool, "points": int, "days": int,
+                  "balance": Any, "message": str}
+        """
+        if not self.client:
+            return {"success": False, "already": False, "points": 0, "days": 0,
+                    "balance": None, "message": "115 客户端未初始化"}
+
+        # 先查状态，已签到就直接返回，避免重复调用签到接口触发风控
+        status = self.points_sign_status()
+        if status.get("success") and status.get("signed"):
+            return {
+                "success": True,
+                "already": True,
+                "points": 0,
+                "days": int(status.get("days") or 0),
+                "balance": None,
+                "message": f"今日已签到，连续签到 {status.get('days') or 0} 天"
+            }
+
+        try:
+            self.rate_limiter.wait()
+            self._api_call_count += 1
+            result = self.client.user_points_sign_post()
+        except Exception as e:
+            logger.error(f"115 签到失败: {e}")
+            return {"success": False, "already": False, "points": 0, "days": 0,
+                    "balance": None, "message": f"签到失败：{e}"}
+
+        if not isinstance(result, dict) or not result.get("state"):
+            message = (result or {}).get("error", "接口返回失败") if isinstance(result, dict) else "接口返回失败"
+            return {"success": False, "already": False, "points": 0, "days": 0,
+                    "balance": None, "message": str(message)}
+
+        data = result.get("data") or {}
+        points = int(data.get("points_num") or 0)
+        days = int(data.get("continuous_day") or 0)
+        return {
+            "success": True,
+            "already": False,
+            "points": points,
+            "days": days,
+            "balance": data.get("points") or data.get("balance"),
+            "message": f"签到成功，连续签到 {days} 天，获得 {points} 枫叶"
+        }

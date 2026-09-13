@@ -129,8 +129,31 @@ def _install_stubs():
 _install_stubs()
 
 
-def import_module_file(name, path):
+def import_module_file(name, path, package=None):
+    """以真实包语义导入插件内的模块文件。
+
+    v1.8.1 起 ``clients/dian115.py`` 使用相对导入（``from .dian115_turnstile
+    import ...``），因此裸 ``exec`` 会报
+    ``ImportError: attempted relative import with no known parent package``。
+    这里改为用 ``importlib`` 按真实包路径加载，保证相对导入与 import 期
+    行为（含注解求值）都被真实覆盖。
+    """
     spec_path = pathlib.Path(path)
+    if package:
+        import importlib.util
+        qualified = f"{package}.{spec_path.stem}"
+        for parent in _ensure_package_chain(package):
+            pass
+        spec = importlib.util.spec_from_file_location(qualified, str(spec_path))
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[qualified] = mod
+        try:
+            spec.loader.exec_module(mod)
+        except Exception:
+            sys.modules.pop(qualified, None)
+            raise
+        return mod
+
     src = spec_path.read_text(encoding="utf-8")
     mod = types.ModuleType(name)
     mod.__file__ = str(spec_path)
@@ -139,14 +162,41 @@ def import_module_file(name, path):
     return mod
 
 
+def _ensure_package_chain(package):
+    """为 ``a.b.c`` 依次注册命名空间包，使相对导入可解析。"""
+    import importlib.machinery
+    import importlib.util
+
+    parts = package.split(".")
+    made = []
+    for index in range(1, len(parts) + 1):
+        name = ".".join(parts[:index])
+        if name in sys.modules:
+            continue
+        mod = types.ModuleType(name)
+        mod.__path__ = [str(PLUGIN / pathlib.Path(*parts[:index]))]
+        spec = importlib.machinery.ModuleSpec(name, loader=None, is_package=True)
+        spec.submodule_search_locations = mod.__path__
+        mod.__spec__ = spec
+        sys.modules[name] = mod
+        made.append(name)
+    return made
+
+
 targets = [
-    ("_guard_dian115", "clients/dian115.py"),
-    ("_guard_checkin", "handlers/checkin.py"),
+    # (模块名, 相对路径, 包名)；包名非空时按真实包语义加载（支持相对导入）。
+    # 顺序敏感：被相对导入的模块必须排在前面，否则解析不到。
+    ("_guard_turnstile", "clients/dian115_turnstile.py", "_p115subsearch_probe.clients"),
+    ("_guard_dian115", "clients/dian115.py", "_p115subsearch_probe.clients"),
+    ("_guard_checkin", "handlers/checkin.py", None),
 ]
 
-for mod_name, rel in targets:
+for mod_name, rel, package in targets:
     try:
-        m = import_module_file(mod_name, PLUGIN / rel)
+        m = import_module_file(mod_name, PLUGIN / rel, package=package)
+        if package:
+            # 契约检查段按 mod_name 索引，这里补一个别名键
+            sys.modules[mod_name] = m
         ok = m is not None
     except Exception as e:  # noqa: BLE001 - 需要把任何导入期错误都暴露出来
         ok = False

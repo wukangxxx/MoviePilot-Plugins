@@ -281,11 +281,18 @@ check("D4-1 屏蔽态且已[-1]时保持[-1]", MOCK_STORE.get('RssSites') == [-1
 check("D4-2 已有备份不被覆盖", p7._rss_sites_backup == ORIGINAL_RSS)
 
 # 版本断言
-check("V1 插件版本=1.8.0", P115SubSearch.plugin_version == "1.8.0", f"actual={P115SubSearch.plugin_version}")
+# 注意：这里只做「双同步一致性」校验，不硬编码具体版本号——
+# 否则每次升版都要改测试（v1.5.x 曾因此反复出现假失败）。
 import json
+_VERSION = P115SubSearch.plugin_version
 pkg = json.loads((PLUGIN.parent.parent / 'package.v2.json').read_text(encoding='utf-8'))
-check("V2 package.v2.json 版本=v1.8.0", pkg['P115SubSearch']['version'] == 'v1.8.0')
-check("V3 package.v2.json 含 v1.8.0 history", 'v1.8.0' in pkg['P115SubSearch']['history'])
+check(f"V1 package.v2.json 版本与 plugin_version 一致（{_VERSION}）",
+      pkg['P115SubSearch']['version'] == _VERSION,
+      f"plugin_version={_VERSION}, pkg={pkg['P115SubSearch']['version']}")
+check("V2 version 为三段式语义版本", _VERSION.count(".") == 2, f"actual={_VERSION}")
+check("V3 package.v2.json 含当前版本 history",
+      f'v{_VERSION}' in pkg['P115SubSearch']['history'],
+      f"missing=v{_VERSION}")
 
 # ---------------- 结果 ----------------
 

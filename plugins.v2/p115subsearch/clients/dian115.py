@@ -3,8 +3,7 @@
 Dian115（癫影）资源查询 / 签到 / 转盘客户端。
 
 精简自 MoviePilot-PanSearch 插件的 ``search/dian115`` 实现，保留站点的
-**必备握手协议**，去掉与多源搜索框架绑定的部分（Points 预算、Turnstile
-浏览器验证、分级限速器）。
+**必备握手协议**，去掉与多源搜索框架绑定的部分（Points 预算、分级限速器）。
 
 必须保留的握手（服务端强制校验，缺一不可）：
     1. GET  /api/portal/auth/browser-challenge  -> { proof, ttl }
@@ -30,14 +29,27 @@ Dian115（癫影）资源查询 / 签到 / 转盘客户端。
     2. 环境没有 curl_cffi 时回退普通 ``requests``，届时登录大概率被
        人机验证拦截，日志会给出明确的依赖安装提示，而不是静默失败。
 
+Cloudflare Turnstile（v1.8.1 起）
+--------------------------------
+癫影对登录与解锁接口都强制 Turnstile。手工复制 ``__Host-portal_token``
+的方案只能撑 24 小时，维护成本过高。v1.8.1 起接入
+:mod:`clients.dian115_turnstile` 自动解算（cloakbrowser 反检测浏览器，
+纯本地，无需付费 solver）：
+
+* ``auto_login=True``（默认）且环境具备 cloakbrowser 时，账号密码即可
+  全自动登录，**无需再手工粘贴 Token**；
+* 环境缺失 cloakbrowser 时抛 ``code="browser_unavailable"``，上层可
+  回退到手工 Token 路径，**不破坏兼容**；
+* 手工粘贴的 ``__Host-portal_token`` 仍然有效，且优先级高于账号密码
+  （省下一次登录请求）。
+
 未保留的部分：
-    * Cloudflare Turnstile 浏览器破解：登录/解锁若仍被要求人机验证，本客户端会抛出
-      code="turnstile_required" 的明确错误，而不是静默失败；
     * 积分解锁预算：P115SubSearch 只做「已解锁 / 免费」的 115 分享链接，
       不消耗积分解锁。
 """
 
 import base64
+import json
 import os
 import re
 import threading
@@ -47,6 +59,8 @@ from urllib.parse import urljoin, urlsplit
 
 import requests
 from app.log import logger
+
+from .dian115_turnstile import Dian115Turnstile, Dian115TurnstileUnavailable
 
 # 软依赖：TLS 指纹伪装。缺失时回退普通 requests（见模块说明）。
 try:
@@ -126,6 +140,29 @@ def is_115_share_url(url: str) -> bool:
     return bool(re.match(r"^https?://(?:www\.)?(?:115\.com|115cdn\.com|anxia\.com)/s/", value))
 
 
+def _jwt_expires_at(token: str) -> float:
+    """从 ``__Host-portal_token``（JWT）里解出 ``exp``。
+
+    站点签发的该 Cookie 是标准 JWT（HS256），payload 含 ``exp``，
+    ``Max-Age=86400``（24 小时）。本地解出过期时间即可在 UI 上提示
+    剩余有效期，无需额外请求。
+
+    :return: Unix 时间戳；解析失败返回 0.0（调用方据此判断为「未知」）
+    """
+    value = str(token or "").strip()
+    if value.count(".") != 2:
+        return 0.0
+    try:
+        payload_segment = value.split(".")[1]
+        padding = "=" * (-len(payload_segment) % 4)
+        payload = json.loads(
+            base64.urlsafe_b64decode(payload_segment + padding).decode("utf-8")
+        )
+        return float(payload.get("exp") or 0)
+    except Exception:
+        return 0.0
+
+
 class Dian115Client:
     """Dian115 门户客户端：登录 + 资源查询 + 签到 + 转盘。
 
@@ -168,12 +205,18 @@ class Dian115Client:
             get_data_func: Optional[Callable] = None,
             save_data_func: Optional[Callable] = None,
             token: str = "",
+            auto_login: bool = True,
+            browser_proxy: Any = None,
     ):
         self._email = str(email or "").strip()
         self._password = str(password or "").strip()
         self._explicit_token = str(token or "").strip()
+        self._auto_login = bool(auto_login)
         self.base_url = str(base_url or self.BASE_URL).rstrip("/")
         self._proxies = self._normalize_proxies(proxy)
+        # 浏览器专用代理（默认复用 HTTP 代理）；与门户请求代理解耦，
+        # 便于用户单独指定海外出口给 Cloudflare 验证使用
+        self._browser_proxy_setting = browser_proxy
         self._timeout = max(5, min(int(timeout or 30), 120))
         self._request_interval = max(0.2, min(float(request_interval or 1.0), 10.0))
         self._get_data_func = get_data_func
@@ -200,6 +243,10 @@ class Dian115Client:
         self._cooldown_until = 0.0
         self._cooldown_status = 0
         self._turnstile_policy: Optional[tuple] = None
+        # Turnstile 解算器（懒创建；环境缺失 cloakbrowser 时保持 None）
+        self._turnstile: Optional[Dian115Turnstile] = None
+        # 环境不可用标记：一旦确认缺失就不再重复尝试导入，直接走手工 Token 回退
+        self._turnstile_unavailable: str = ""
         self._restore_auth_cookie()
 
     # ------------------------------------------------------------------
@@ -241,11 +288,13 @@ class Dian115Client:
             password: str,
             proxy: Any = None,
             request_interval: float = 1.0,
+            auto_login: bool = True,
     ) -> bool:
         """判断现有实例是否仍匹配最新配置（用于复用长连接）。"""
         return (
                 self._email == str(email or "").strip()
                 and self._password == str(password or "").strip()
+                and self._auto_login == bool(auto_login)
                 and self._proxies == self._normalize_proxies(proxy)
                 and abs(self._request_interval
                         - max(0.2, min(float(request_interval or 1.0), 10.0))) < 1e-6
@@ -264,6 +313,8 @@ class Dian115Client:
             self._proof = None
             self._browser_session_expires_at = 0.0
             self._authenticated = False
+            # 释放 Turnstile 浏览器（子线程内关闭，避免阻塞调用方）
+            self._close_turnstile()
 
     @staticmethod
     def _normalize_proxies(proxy: Any) -> Dict[str, str]:
@@ -283,17 +334,54 @@ class Dian115Client:
     def _cookie(self, name: str) -> str:
         return str(self._session.cookies.get_dict().get(name) or "")
 
+    def _drop_cookie(self, name: str) -> None:
+        """删除会话 Cookie（兼容 requests / curl_cffi 两套 Cookie 容器）。
+
+        两个坑都踩过：
+          * ``requests`` 的 ``RequestsCookieJar`` **没有 ``delete()``**
+            （``http.cookiejar.CookieJar`` 也没有），历史实现误用 ``delete()``
+            导致 ``_apply_token`` 每次在写入前抛 AttributeError 被吞掉，
+            表现为「Token 填了却始终未登录」；
+          * ``curl_cffi`` 的 ``Cookies.clear()`` **不接受 ``name`` 关键字**
+            （只有 domain/path），照搬 requests 的签名同样抛 TypeError。
+
+        因此这里改成「只依赖两套实现都稳定的 `set(name, "", expire=0)`
+        过期法」，任何一步失败都不影响后续写入。
+        """
+        try:
+            # 最稳妥：把该 Cookie 置空并立即过期——requests 的 jar 会把它
+            # 标记为已过期（max-age=0 → 源站不再看到该值）
+            old = self._session.cookies.get(name)
+            if old is not None:
+                self._session.cookies.set(name, "", expire=0)
+        except Exception:
+            pass
+        try:
+            # requests 分支：标准 cookiejar 的 clear(domain, path, name)
+            self._session.cookies.clear(domain="m.dian115.com", path="/", name=name)
+        except Exception:
+            pass
+        try:
+            # curl_cffi 分支：Cookies 支持按键删除
+            if name in self._session.cookies.get_dict():
+                del self._session.cookies[name]
+        except Exception:
+            pass
+
     def _restore_auth_cookie(self) -> None:
         """装载认证 Cookie。
 
         优先级：
             1. 用户在插件配置里手工粘贴的浏览器 Token（``token`` 参数）——
-               站点已对「邮箱+密码」登录开启 Cloudflare 人机验证，
-               实测（2026-09-13）账号密码登录必被 turnstile 拦截，
-               只有通过浏览器登录后复制 ``__Host-portal_token`` 才可用；
-            2. 上次成功登录后持久化到插件数据里的 token。
+               手工 Token 一定是最新鲜的，先用它可省下一次登录请求；
+               其 JWT ``exp`` 已过期时直接忽略，转走自动登录；
+            2. 上次成功登录（含自动登录）后持久化到插件数据里的 token。
         """
         token = self._explicit_token
+        expires_at = _jwt_expires_at(token)
+        if token and expires_at and expires_at <= time.time():
+            logger.info("癫影手工 Token 已过期（JWT exp 到期），转为自动登录")
+            token = ""
         if not token and self._get_data_func:
             try:
                 data = self._get_data_func(SESSION_DATA_KEY) or {}
@@ -302,7 +390,10 @@ class Dian115Client:
                         and str(data.get("email") or "").casefold() == self._email.casefold()
                         and data.get("base_url", self.BASE_URL) == self.base_url
                 ):
-                    token = str(data.get("token") or "")
+                    saved = str(data.get("token") or "")
+                    saved_expires_at = _jwt_expires_at(saved)
+                    if saved and (not saved_expires_at or saved_expires_at > time.time()):
+                        token = saved
             except Exception as e:
                 logger.debug(f"读取 Dian115 会话失败: {e}")
         if token:
@@ -311,10 +402,18 @@ class Dian115Client:
     def _apply_token(self, token: str) -> None:
         """把 token 写入会话 Cookie 并标记为已认证。"""
         try:
-            self._session.cookies.delete("__Host-portal_token")
-            self._session.cookies.set("__Host-portal_token", token, secure=True)
+            self._drop_cookie("__Host-portal_token")
+            # 同时给 domain 与 path：__Host- 前缀 Cookie 的规范约束是
+            # Secure + Path=/ + 无 Domain；显式给 domain 让两套实现都能命中
+            self._session.cookies.set(
+                "__Host-portal_token", token, domain="m.dian115.com",
+                path="/", secure=True,
+            )
         except Exception as e:
             logger.warning(f"写入 Dian115 Token 失败: {e}")
+            return
+        if not self._cookie("__Host-portal_token"):
+            logger.warning("写入 Dian115 Token 后回读为空，认证态不可用")
             return
         self._saved_token = token
         self._authenticated = True
@@ -339,7 +438,7 @@ class Dian115Client:
 
     def _clear_portal_cookies(self) -> None:
         for name in self._PORTAL_COOKIES:
-            self._session.cookies.delete(name)
+            self._drop_cookie(name)
         self._proof = None
         self._browser_session_expires_at = 0.0
         self._server_time_offset_ms = 0
@@ -548,8 +647,61 @@ class Dian115Client:
     # ------------------------------------------------------------------
     # 登录
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Cloudflare Turnstile 自动解算（v1.8.1）
+    # ------------------------------------------------------------------
+    def _browser_proxy(self) -> Any:
+        """浏览器使用的代理。
+
+        优先使用独立配置的 ``browser_proxy``；未配置时复用门户请求代理
+        （puppeteer/playwright 只接受单个代理字符串，不接受 requests 的
+        ``{"http": ..., "https": ...}`` 字典）。
+        """
+        value = self._browser_proxy_setting
+        if value:
+            if isinstance(value, dict):
+                return value.get("https") or value.get("http") or None
+            return str(value)
+        if self._proxies:
+            return self._proxies.get("https") or self._proxies.get("http") or None
+        return None
+
+    def _close_turnstile(self) -> None:
+        """释放 Turnstile 解算器（幂等）。"""
+        solver, self._turnstile = self._turnstile, None
+        if solver is None:
+            return
+        try:
+            solver.close()
+        except Exception as error:
+            logger.debug(f"Dian115 释放验证浏览器失败：{type(error).__name__}")
+
+    def _turnstile_browser_ready(self) -> bool:
+        """探测浏览器环境是否可用（结果缓存，避免重复 import）。"""
+        if self._turnstile_unavailable:
+            return False
+        try:
+            from cloakbrowser import launch_context  # noqa: F401
+        except ImportError as error:
+            self._turnstile_unavailable = str(error) or "cloakbrowser 未安装"
+            return False
+        return True
+
+    @property
+    def auto_login_available(self) -> bool:
+        """自动登录是否可用（供 UI / 日志 / 状态诊断使用）。"""
+        return bool(self._email and self._password
+                    and self._auto_login
+                    and self._turnstile_browser_ready())
+
     def _turnstile_token(self, action: str, allow_browser: bool) -> Optional[str]:
-        """读取人机验证策略；本精简实现不驱动浏览器，只给出明确错误。"""
+        """获取登录/解锁所需的 Turnstile token。
+
+        :param action: ``portal_login`` 或 ``portal_unlock``
+        :param allow_browser: 是否允许驱动浏览器解算。签到等后台链路传
+            ``False``，避免在任务线程里冷启动浏览器。
+        :raises Dian115Error: 策略异常 / 浏览器不可用 / 解算失败
+        """
         cached = self._turnstile_policy
         now = time.monotonic()
         if cached and cached[1] > now:
@@ -560,13 +712,58 @@ class Dian115Client:
             )
             self._turnstile_policy = (policy, now + 300)
         if policy.get("turnstile_enabled") is False:
+            # 站点关掉了人机验证，直接走纯净登录
             return None
-        raise Dian115Error(
-            "癫影已对「邮箱+密码」登录开启 Cloudflare 人机验证，无法自动登录。"
-            "请在浏览器登录 m.dian115.com 后复制 Cookie 中的 __Host-portal_token，"
-            "粘贴到插件「癫影」页签的「浏览器 Token」中保存（有效期约 24 小时，过期后需重新获取）",
-            code="turnstile_required",
-        )
+        if policy.get("turnstile_enabled") is not True:
+            raise Dian115Error(
+                "Dian115 未返回 Cloudflare 验证策略", code="schema_changed"
+            )
+        site_key = str(policy.get("turnstile_site_key") or "").strip()
+        if not site_key:
+            raise Dian115Error(
+                "Dian115 未返回 Cloudflare site key", code="schema_changed"
+            )
+        if not allow_browser:
+            raise Dian115Error(
+                "该接口需要 Cloudflare 人机验证，但当前链路不允许驱动浏览器；"
+                "请先手动刷新账户登录状态",
+                code="browser_login_forbidden",
+            )
+        if not self._auto_login:
+            raise Dian115Error(
+                "癫影已开启 Cloudflare 人机验证，且插件「自动登录」开关为关闭状态。"
+                "请在「癫影」页签打开「自动登录（Cloudflare 验证）」，"
+                "或手工粘贴浏览器 Cookie 中的 __Host-portal_token",
+                code="turnstile_required",
+            )
+        if not self._turnstile_browser_ready():
+            raise Dian115Error(
+                "癫影需要 Cloudflare 人机验证，但当前环境缺少 cloakbrowser 浏览器"
+                f"（{self._turnstile_unavailable or '未知原因'}）。"
+                "请在 MoviePilot 内运行，或手工粘贴 __Host-portal_token",
+                code="browser_unavailable",
+            )
+        try:
+            if self._turnstile is None:
+                self._turnstile = Dian115Turnstile(
+                    self.base_url, self._browser_proxy()
+                )
+            solver = self._turnstile
+            token = solver.token(site_key, action)
+            if not token:
+                raise RuntimeError("Cloudflare 未返回验证 token")
+            return token
+        except Dian115TurnstileUnavailable as error:
+            raise Dian115Error(str(error), code="browser_unavailable") from error
+        except TimeoutError as error:
+            raise Dian115Error("Dian115 Cloudflare 验证超时", code="turnstile_timeout") from error
+        except RuntimeError as error:
+            raise Dian115Error(str(error), code="turnstile_failed") from error
+        except Exception as error:
+            raise Dian115Error(
+                f"Dian115 Cloudflare 验证失败：{type(error).__name__}",
+                code="turnstile_failed",
+            ) from error
 
     def _login(self, allow_browser_login: bool = True) -> None:
         if self._authenticated:
@@ -591,6 +788,23 @@ class Dian115Client:
             )
         self._authenticated = True
         logger.info("Dian115 登录成功")
+
+    def login_status(self) -> Dict[str, Any]:
+        """供 UI / 诊断使用的登录态摘要（**不发起任何网络请求**）。"""
+        token = self._explicit_token or self._saved_token
+        expires_at = _jwt_expires_at(token)
+        return {
+            "email": self._email,
+            "has_password": bool(self._password),
+            "auto_login": self._auto_login,
+            "browser_available": self._turnstile_browser_ready(),
+            "browser_error": self._turnstile_unavailable,
+            "has_token": bool(token),
+            "token_expires_at": expires_at,
+            "token_remaining_hours": (
+                round(max(0.0, expires_at - time.time()) / 3600, 1) if expires_at else None
+            ),
+        }
 
     # ------------------------------------------------------------------
     # 统一请求入口
@@ -640,7 +854,7 @@ class Dian115Client:
                     retry_proof = False
                     self._proof = None
                     self._browser_session_expires_at = 0.0
-                    self._session.cookies.delete("__Host-portal_browser")
+                    self._drop_cookie("__Host-portal_browser")
                     logger.debug(f"Dian115 浏览器证明失效，重新握手：{api_path}")
                     continue
                 if (

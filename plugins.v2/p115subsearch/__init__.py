@@ -40,7 +40,7 @@ class P115SubSearch(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/cloud.png"
     # 插件版本
-    plugin_version = "1.8.0"
+    plugin_version = "1.8.1"
     # 插件作者
     plugin_author = "mrtian2016"
     # 作者主页
@@ -118,8 +118,14 @@ class P115SubSearch(_PluginBase):
     _dian115_enabled: bool = False
     _dian115_email: str = ""
     _dian115_password: str = ""
-    # 浏览器登录后复制的 __Host-portal_token；站点已对账号密码登录开启人机验证，
-    # 这是唯一可行的认证方式（有效期约 24 小时）
+    # v1.8.1：自动登录（cloakbrowser 本地解 Cloudflare Turnstile），
+    # 开启后账号密码即可全自动登录，不再需要每 24 小时手工换 Token
+    _dian115_auto_login: bool = True
+    # 浏览器独立代理（留空则复用插件全局代理）；Cloudflare 验证需海外出口时使用
+    _dian115_browser_proxy: str = ""
+    # 会话保活周期（Cron）；留空则仅在任务执行时按需登录
+    _dian115_login_cron: str = ""
+    # 浏览器登录后复制的 __Host-portal_token（可选兜底；此前是唯一认证方式）
     _dian115_token: str = ""
     # 积分解锁与预算（与 HDHive 同一套语义；默认关闭，不开就绝不扣分）
     _dian115_auto_unlock: bool = False
@@ -762,10 +768,13 @@ class P115SubSearch(_PluginBase):
             self._kdocs_batch_rows = int(config.get("kdocs_batch_rows", 1000) or 1000)
             self._kdocs_cookie = config.get("kdocs_cookie", "") or ""
 
-            # 癫影（Dian115）配置（v1.8.0）
+            # 癫影（Dian115）配置（v1.8.0 / v1.8.1 增自动登录）
             self._dian115_enabled = config.get("dian115_enabled", False)
             self._dian115_email = (config.get("dian115_email", "") or "").strip()
             self._dian115_password = config.get("dian115_password", "") or ""
+            self._dian115_auto_login = config.get("dian115_auto_login", True)
+            self._dian115_browser_proxy = (config.get("dian115_browser_proxy", "") or "").strip()
+            self._dian115_login_cron = (config.get("dian115_login_cron", "") or "").strip()
             self._dian115_token = (config.get("dian115_token", "") or "").strip()
 
             # 签到配置（v1.8.0）
@@ -952,25 +961,37 @@ class P115SubSearch(_PluginBase):
         """初始化癫影（Dian115）客户端。
 
         搜索与签到共用同一实例，登录态通过插件数据持久化复用。
-        未配置账号时不创建实例，避免无意义的握手开销。
+
+        认证方式（v1.8.1 起双通道）：
+            1. **自动登录**（推荐）：填写邮箱+密码并保持「自动登录」开启，
+               插件用内置 cloakbrowser 本地解 Cloudflare Turnstile，
+               全自动登录，无需任何手工操作；
+            2. **手工 Token**（兜底）：粘贴浏览器 Cookie 中的
+               ``__Host-portal_token``，环境缺浏览器时仍可用（约 24 小时）。
         """
         self._dian115_client = None
         need_dian115 = self._dian115_enabled or self._dian115_checkin_enabled
         if not need_dian115:
             return
 
-        if not self._dian115_token:
-            logger.warning(
-                "癫影已启用（搜索或签到）但未配置浏览器 Token；"
-                "站点已对账号密码登录开启人机验证，请在「癫影」页签粘贴 __Host-portal_token"
-            )
-            return
+        if not self._dian115_email or not self._dian115_password:
+            # 无账号密码时只能靠手工 Token；两者都没有则不必创建实例
+            if not self._dian115_token:
+                logger.warning(
+                    "癫影已启用（搜索或签到）但既未配置账号密码、也未配置手工 Token，"
+                    "无法建立会话；请在「癫影」页签填写账号密码（推荐）或粘贴 __Host-portal_token"
+                )
+                return
+            if self._dian115_auto_login:
+                logger.info("癫影未配置账号密码，本实例仅使用手工 Token 认证")
 
         try:
             self._dian115_client = Dian115Client(
                 email=self._dian115_email,
                 password=self._dian115_password,
                 token=self._dian115_token,
+                auto_login=self._dian115_auto_login,
+                browser_proxy=self._dian115_browser_proxy or None,
                 proxy=proxy,
                 get_data_func=self.get_data,
                 save_data_func=self.save_data
@@ -988,7 +1009,31 @@ class P115SubSearch(_PluginBase):
             self._dian115_client = None
             return
 
-        logger.info("癫影（Dian115）客户端初始化成功")
+        # 认证路径自检：账号密码 + 自动登录 或 手工 Token，二者至少有一个
+        status = self._dian115_client.login_status()
+        if status.get("has_token"):
+            remaining = status.get("token_remaining_hours")
+            if remaining:
+                logger.info(f"癫影（Dian115）客户端就绪：使用手工 Token，剩余约 {remaining} 小时")
+            else:
+                logger.info("癫影（Dian115）客户端就绪：使用手工 Token")
+        elif self._dian115_email and self._dian115_password and self._dian115_auto_login:
+            if status.get("browser_available"):
+                logger.info(
+                    "癫影（Dian115）客户端就绪：自动登录已启用（本地解 Cloudflare 验证，"
+                    "首次登录约需 10 秒）"
+                )
+            else:
+                logger.warning(
+                    "癫影自动登录不可用（%s），且未配置手工 Token；"
+                    "癫影相关功能会失败。请改用 MoviePilot 环境或手工粘贴 __Host-portal_token"
+                    % (status.get("browser_error") or "未知原因")
+                )
+        else:
+            logger.warning(
+                "癫影（Dian115）客户端已创建，但缺少可用认证：请填写账号密码并开启自动登录，"
+                "或粘贴 __Host-portal_token"
+            )
 
     # ------------------ HDHive OpenAPI ------------------
 
@@ -1182,10 +1227,13 @@ class P115SubSearch(_PluginBase):
             "kdocs_cache_ttl_hours": self._kdocs_cache_ttl_hours,
             "kdocs_batch_rows": self._kdocs_batch_rows,
             "kdocs_cookie": self._kdocs_cookie,
-            # 癫影配置（v1.8.0）
+            # 癫影配置（v1.8.0 / v1.8.1 增自动登录）
             "dian115_enabled": self._dian115_enabled,
             "dian115_email": self._dian115_email,
             "dian115_password": self._dian115_password,
+            "dian115_auto_login": self._dian115_auto_login,
+            "dian115_browser_proxy": self._dian115_browser_proxy,
+            "dian115_login_cron": self._dian115_login_cron,
             "dian115_token": self._dian115_token,
             "dian115_auto_unlock": self._dian115_auto_unlock,
             "dian115_max_unlock_points": self._dian115_max_unlock_points,
@@ -1365,11 +1413,63 @@ class P115SubSearch(_PluginBase):
             "kwargs": {}
         }]
 
+    def _build_dian115_login_service(self) -> List[Dict[str, Any]]:
+        """构建癫影会话保活服务（v1.8.1）。
+
+        仅有在「自动登录」开启、账号密码齐备、且用户填了保活周期时才注册。
+        目的：在没有搜索/签到任务的时段也定期刷新一次登录态，
+        让任务执行时无需等待浏览器冷启动（首次约 10 秒）。
+        """
+        if not self._dian115_login_cron:
+            return []
+        if not (self._dian115_auto_login and self._dian115_email and self._dian115_password):
+            logger.info("癫影保活周期已配置，但自动登录未就绪（缺账号密码或开关关闭），不注册保活服务")
+            return []
+        if not (self._dian115_enabled or self._dian115_checkin_enabled):
+            return []
+
+        try:
+            trigger = CronTrigger.from_crontab(self._dian115_login_cron)
+        except Exception as e:
+            logger.warning(
+                f"癫影保活 Cron 表达式无效：{self._dian115_login_cron}，本次不注册。错误：{e}"
+            )
+            return []
+
+        return [{
+            "id": "P115SubSearchDian115Login",
+            "name": "癫影会话保活服务",
+            "trigger": trigger,
+            "func": self.dian115_login_service,
+            "kwargs": {}
+        }]
+
+    def dian115_login_service(self):
+        """定时刷新癫影登录态（保活）。
+
+        失败不抛异常——保活失败不应污染 MoviePilot 的服务调度日志，
+        真正的搜索/签到任务会自行再登录一次。
+        """
+        client = self._dian115_client
+        if not client:
+            return
+        try:
+            info = client.get_account_info()
+            logger.info(
+                "癫影会话保活成功：%s，积分 %s"
+                % (info.get("name") or "未知", info.get("points") or 0)
+            )
+        except Exception as e:
+            logger.warning(f"癫影会话保活失败（不影响后续任务）: {e}")
+
     def get_service(self) -> List[Dict[str, Any]]:
         services = []
 
         # 签到服务独立于订阅搜索主开关：只要启用签到就注册（v1.8.0）
         services.extend(self._build_checkin_service())
+
+        # 癫影会话保活（v1.8.1）：同样独立于主开关，只看自身配置
+        services.extend(self._build_dian115_login_service())
 
         if not self._enabled:
             return services

@@ -421,6 +421,38 @@ class UIConfig:
                      'content': [{'component': 'VTextField', 'props': {'model': 'dian115_password', 'label': '癫影密码', 'type': 'password', 'placeholder': '登录密码', 'clearable': True}}]}
                 ]
             },
+            UIConfig._alert('自动登录（推荐）：填写账号密码后保持下方「自动登录」开启即可，插件会调用内置 '
+                            'cloakbrowser 反检测浏览器在本地完成 Cloudflare 人机验证，全程无需手工操作，'
+                            '登录态自动持久化并续期。首次登录约需 10 秒（需启动浏览器内核），之后复用会话仅 1~2 秒。',
+                            'success'),
+            {
+                'component': 'VRow',
+                'content': [{
+                    'component': 'VCol',
+                    'props': {'cols': 12},
+                    'content': [{'component': 'VSwitch', 'props': {
+                        'model': 'dian115_auto_login',
+                        'label': '自动登录（Cloudflare 验证）',
+                        'hint': '默认开启。账号密码 + 本地浏览器自动过 Cloudflare 人机验证，无需再手工维护 Token。'
+                                '关闭后只能依赖下方手工 Token（约 24 小时过期）'
+                    }}]
+                }]
+            },
+            {
+                'component': 'VRow',
+                'content': [{
+                    'component': 'VCol',
+                    'props': {'cols': 12},
+                    'content': [{'component': 'VTextField', 'props': {
+                        'model': 'dian115_browser_proxy',
+                        'label': '浏览器专用代理（可选）',
+                        'placeholder': 'http://127.0.0.1:7890',
+                        'clearable': True,
+                        'hint': '留空则复用全局代理。Cloudflare 验证需要海外出口、而门户请求想走直连时可单独配置',
+                        'persistent-hint': True
+                    }}]
+                }]
+            },
             {
                 'component': 'VRow',
                 'content': [{
@@ -428,21 +460,32 @@ class UIConfig:
                     'props': {'cols': 12},
                     'content': [{'component': 'VTextarea', 'props': {
                         'model': 'dian115_token',
-                        'label': '浏览器 Token（__Host-portal_token）',
+                        'label': '手工 Token（可选兜底，__Host-portal_token）',
                         'rows': 2,
                         'placeholder': '浏览器登录 m.dian115.com 后，F12 → 应用 → Cookie → 复制 __Host-portal_token 的值',
                         'clearable': True,
-                        'hint': '站点已对「邮箱+密码」自动登录开启人机验证，必须通过浏览器手动登录获取 Token；有效期约 24 小时，过期后需重新获取',
+                        'hint': '仅当自动登录不可用（非 MoviePilot 环境 / 缺少浏览器内核）时才需要。'
+                                '优先级高于账号密码；有效期约 24 小时',
                         'persistent-hint': True
                     }}]
                 }]
             },
-            UIConfig._alert('说明：癫影搜索与签到都必须依赖上方 Token（账号密码仅供记录与 Token 归属校验）。'
-                            'Token 过期时日志会提示「unauthorized / 未登录」，重新粘贴即可，无需重启插件。', 'warning'),
-            UIConfig._alert('重要实测结论：癫影的 115 链接 100% 需要积分解锁，而解锁接口带 Cloudflare 人机验证，'
-                            '精简客户端无法自动通过（会返回 turnstile_failed，不会误扣积分）。'
-                            '因此本插件的癫影搜索源在不解锁时返回 0 条；建议把癫影主要用于「签到 + 转盘」赚积分，'
-                            '搜索仍走「盘搜」。', 'info'),
+            {
+                'component': 'VRow',
+                'content': [{
+                    'component': 'VCol',
+                    'props': {'cols': 12},
+                    'content': [{'component': 'VCronField', 'props': {
+                        'model': 'dian115_login_cron',
+                        'label': '癫影会话保活周期（Cron）',
+                        'placeholder': '0 */12 * * *',
+                        'hint': '可选。留空则仅在搜索/签到任务时按需登录。填报后插件会在该周期内主动续期登录态，'
+                                '好处是任务执行时无需等待浏览器冷启动（首次约 10 秒）',
+                        'persistent-hint': True,
+                        'clearable': True
+                    }}]
+                }]
+            },
             {
                 'component': 'VRow',
                 'content': [{
@@ -450,9 +493,9 @@ class UIConfig:
                     'props': {'cols': 12},
                     'content': [{'component': 'VSwitch', 'props': {
                         'model': 'dian115_auto_unlock',
-                        'label': '自动消耗积分解锁资源（需解锁接口可用）',
-                        'hint': '默认关闭。开启后遇到收费条目会尝试解锁；若站点要求人机验证则自动跳过并记日志，'
-                                '不会扣分也不会中断任务。'
+                        'label': '自动消耗积分解锁资源',
+                        'hint': '默认关闭。开启后遇到收费条目会自动调用解锁接口（同样由自动登录解 Cloudflare 验证）；'
+                                '预算不足或验证失败时自动跳过并记日志，不会误扣积分、不会中断任务。'
                     }}]
                 }]
             },
@@ -655,10 +698,13 @@ class UIConfig:
             "pansou_channels": "QukanMovie",
             "pansou_check_enabled": True,
 
-            # 癫影 Dian115（v1.8.0）
+            # 癫影 Dian115（v1.8.0 / v1.8.1 增自动登录）
             "dian115_enabled": False,
             "dian115_email": "",
             "dian115_password": "",
+            "dian115_auto_login": True,
+            "dian115_browser_proxy": "",
+            "dian115_login_cron": "",
             "dian115_token": "",
             "dian115_auto_unlock": False,
             "dian115_max_unlock_points": 50,

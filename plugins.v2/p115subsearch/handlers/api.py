@@ -72,16 +72,16 @@ class ApiHandler:
         success = self._p115_manager.transfer_share(share_url, save_path or self._save_path)
         return {"success": success}
 
-    def clear_history(self, apikey: str) -> dict:
+    def clear_history(self, apikey: str = "") -> dict:
         """
         API: 清空历史记录
 
-        :param apikey: API 密钥
+        鉴权由 MoviePilot 插件 API 的统一 verify_apikey 依赖完成（v1.8.4 起
+        前端 events 调用不再传 apikey，此处保留形参仅为兼容旧外部调用）。
+
+        :param apikey: API 密钥（已由框架校验，忽略）
         :return: 操作结果
         """
-        if apikey != settings.API_TOKEN:
-            return {"success": False, "message": "API密钥错误"}
-
         if self._save_data:
             self._save_data('history', [])
         logger.info("115网盘订阅搜索历史记录已清空")

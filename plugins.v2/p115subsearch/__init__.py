@@ -137,7 +137,7 @@ class P115SubSearch(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/cloud.png"
     # 插件版本
-    plugin_version = "1.8.3"
+    plugin_version = "1.8.4"
     # 插件作者
     plugin_author = "mrtian2016"
     # 作者主页
@@ -222,6 +222,9 @@ class P115SubSearch(_PluginBase):
     _dian115_browser_proxy: str = ""
     # 会话保活周期（Cron）；留空则仅在任务执行时按需登录
     _dian115_login_cron: str = ""
+    # 账户卡片自动刷新间隔（分钟）；0=关闭。后台定时刷新 115/癫影账户快照，
+    # 配置页打开即见近况，癫影同时兼做会话保活（v1.8.4）
+    _account_refresh_minutes: int = 30
     # 浏览器登录后复制的 __Host-portal_token（可选兜底；此前是唯一认证方式）
     _dian115_token: str = ""
     # 积分解锁与预算（与 HDHive 同一套语义；默认关闭，不开就绝不扣分）
@@ -872,6 +875,13 @@ class P115SubSearch(_PluginBase):
             self._dian115_auto_login = config.get("dian115_auto_login", True)
             self._dian115_browser_proxy = (config.get("dian115_browser_proxy", "") or "").strip()
             self._dian115_login_cron = (config.get("dian115_login_cron", "") or "").strip()
+            # 账户卡片自动刷新间隔（v1.8.4；0=关闭）
+            try:
+                self._account_refresh_minutes = max(0, min(
+                    int(config.get("account_refresh_minutes", 30) or 30), 1440
+                ))
+            except (TypeError, ValueError):
+                self._account_refresh_minutes = 30
             self._dian115_token = (config.get("dian115_token", "") or "").strip()
             # 积分解锁配置（v1.8.2 修复：此前漏读，导致开关保存后被默认值覆盖，永远打不开）
             self._dian115_auto_unlock = config.get("dian115_auto_unlock", False)
@@ -1335,6 +1345,7 @@ class P115SubSearch(_PluginBase):
             "dian115_auto_login": self._dian115_auto_login,
             "dian115_browser_proxy": self._dian115_browser_proxy,
             "dian115_login_cron": self._dian115_login_cron,
+            "account_refresh_minutes": self._account_refresh_minutes,
             "dian115_token": self._dian115_token,
             "dian115_auto_unlock": self._dian115_auto_unlock,
             "dian115_max_unlock_points": self._dian115_max_unlock_points,
@@ -1617,8 +1628,13 @@ class P115SubSearch(_PluginBase):
             "refreshed_at": int(time.time()),
         }
 
-    def _dian115_account_card(self) -> Dict[str, Any]:
-        """把癫影账户信息转换为通用卡片契约。"""
+    def _dian115_account_card(self, allow_browser_login: bool = True) -> Dict[str, Any]:
+        """把癫影账户信息转换为通用卡片契约。
+
+        :param allow_browser_login: token 过期时是否允许触发浏览器自动登录。
+            手动刷新（前端 API）必须传 False——浏览器登录可能耗时 30 秒以上，
+            会让 HTTP 请求超时；后台自动刷新服务传 True，兼做会话保活。
+        """
         client = self._dian115_client
         if client is None:
             if not self._dian115_enabled and not self._dian115_checkin_enabled:
@@ -1633,7 +1649,14 @@ class P115SubSearch(_PluginBase):
         if not status.get("has_token") and not status.get("auto_login"):
             return self._account_card_placeholder("癫影未登录，请填写账号密码或手工 Token")
 
-        info = client.get_account_info()
+        try:
+            info = client.get_account_info(allow_browser_login=allow_browser_login)
+        except Exception as error:
+            if allow_browser_login:
+                raise
+            return self._account_card_placeholder(
+                "癫影登录态已过期，插件会自动重新登录，请稍后再刷新或等待自动刷新"
+            )
         if not isinstance(info, dict):
             return self._account_card_placeholder("癫影账户信息读取失败，请稍后重试")
         if info.get("error") and not info.get("points") and not info.get("name"):
@@ -1718,20 +1741,26 @@ class P115SubSearch(_PluginBase):
 
     # ---- 核心：读卡片（带缓存与冷却） ----
 
-    def _load_account(self, account_key: str) -> Dict[str, Any]:
+    def _load_account(self, account_key: str, allow_browser_login: bool = True) -> Dict[str, Any]:
         """真正去取一次账户信息（会发网络请求）。"""
         normalized = self._normalize_account_key(account_key)
         if normalized == self.ACCOUNT_KEY_P115:
             return self._p115_account_card()
         if normalized == self.ACCOUNT_KEY_DIAN115:
-            return self._dian115_account_card()
+            return self._dian115_account_card(allow_browser_login=allow_browser_login)
         raise ValueError(f"不支持的账户卡片：{normalized}")
 
-    def _account_info(self, account_key: str, refresh: bool = False) -> Tuple[Dict[str, Any], bool]:
+    def _account_info(
+            self, account_key: str, refresh: bool = False,
+            allow_browser_login: bool = True,
+    ) -> Tuple[Dict[str, Any], bool]:
         """
         读取单卡片信息，使用独立快照并实施刷新冷却。
 
-        :return: (account, limited)；limited=True 表示因冷却未真正刷新
+        :param allow_browser_login: 癫影 token 过期时是否允许浏览器自动登录
+            （手动刷新必须 False，避免 HTTP 长阻塞；后台刷新用 True）。
+        :return: (account, limited)；limited=True 表示因冷却未真正刷新。
+            **异常路径不覆盖既有快照**——临时网络抖动不应把好快照冲成占位卡。
         """
         normalized = self._normalize_account_key(account_key)
         snapshot = self._load_account_snapshot(normalized)
@@ -1743,12 +1772,19 @@ class P115SubSearch(_PluginBase):
 
         _account_guard_arm(normalized)
         try:
-            account = self._load_account(normalized)
+            account = self._load_account(normalized, allow_browser_login=allow_browser_login)
         except Exception as error:
             logger.debug(f"读取账户信息失败（{normalized}）：{error}")
-            account = self._account_card_placeholder("账户信息读取失败，请检查登录凭据或稍后重试")
+            placeholder = self._account_card_placeholder(
+                "账户信息读取失败，请检查登录凭据或稍后重试"
+            )
+            placeholder["refreshed_at"] = int(time.time())
+            return placeholder, False
         account["refreshed_at"] = int(time.time())
-        self._save_account_snapshot(normalized, account)
+        # 只有成功拿到已连接卡片才覆盖快照：网络抖动/登录态过期等
+        # 失败结果一律不落盘，避免把好快照冲成占位卡
+        if account.get("connected"):
+            self._save_account_snapshot(normalized, account)
         return account, False
 
     def _cached_account_status(self) -> Dict[str, Any]:
@@ -1806,9 +1842,19 @@ class P115SubSearch(_PluginBase):
             logger.debug(f"采集账户状态失败：{error}")
             return {"cards": []}
 
-    def refresh_account(self, account_key: str) -> Tuple[Dict[str, Any], bool]:
-        """同步刷新单个账户卡片（供 API 路由用 asyncio.to_thread 调用）。"""
-        account, limited = self._account_info(account_key, True)
+    def refresh_account(
+            self, account_key: str, allow_browser_login: bool = False
+    ) -> Tuple[Dict[str, Any], bool]:
+        """
+        同步刷新单个账户卡片（供 API 路由用 asyncio.to_thread 调用）。
+
+        默认 allow_browser_login=False：手动刷新是同步 HTTP 请求，
+        癫影浏览器自动登录可能耗时 30 秒以上导致前端超时；
+        token 过期时返回友好提示，由自动刷新服务负责重新登录。
+        """
+        account, limited = self._account_info(
+            account_key, True, allow_browser_login=allow_browser_login
+        )
         normalized = self._normalize_account_key(account_key)
         # 快照变化后清掉配置页的 options 缓存，下次打开即可见新值
         try:
@@ -1865,14 +1911,18 @@ class P115SubSearch(_PluginBase):
         self._save_account_snapshot(normalized, account)
         return True
 
-    def api_refresh_account(self, apikey: str, key: str = "") -> dict:
-        """手动刷新单个账户信息卡片（插件 API 路由）。"""
-        if apikey != settings.API_TOKEN:
-            return {"success": False, "message": "API 密钥错误"}
+    def api_refresh_account(self, key: str = "") -> dict:
+        """
+        手动刷新单个账户信息卡片（插件 API 路由，POST）。
+
+        鉴权由 MoviePilot 统一的 verify_apikey 依赖完成（plugin.py L158-167），
+        前端 events.click.api 调用不携带 apikey，此处不再重复校验。
+        """
         account_key = str(key or "").strip()
         if not account_key:
             return {"success": False, "message": "缺少账户卡片标识"}
         try:
+            # 手动刷新禁止触发浏览器自动登录（可能 30s+，HTTP 会超时）
             account, limited = self.refresh_account(account_key)
         except ValueError as error:
             return {"success": False, "message": str(error)}
@@ -1880,6 +1930,9 @@ class P115SubSearch(_PluginBase):
             logger.error(f"刷新账户信息失败：{error}")
             return {"success": False, "message": f"刷新账户信息失败：{error}"}
         normalized = self._normalize_account_key(account_key)
+        error_text = str(account.get("error") or "").strip()
+        if error_text and not account.get("connected"):
+            return {"success": False, "message": error_text, "data": {"key": normalized}}
         return {
             "success": True,
             "message": "刷新过于频繁，已显示最近一次账户信息" if limited else "账户信息已刷新",
@@ -2015,6 +2068,45 @@ class P115SubSearch(_PluginBase):
         except Exception as e:
             logger.warning(f"癫影会话保活失败（不影响后续任务）: {e}")
 
+    def account_snapshot_refresh_service(self) -> None:
+        """
+        定时后台刷新账户快照（v1.8.4，满足配置页「自动刷新」诉求）。
+
+        - 115 与癫影逐个刷新，单账户失败不影响另一个；
+        - **成功才覆盖快照**——临时网络抖动不会把好快照冲成占位卡；
+        - 癫影走 get_account_info(allow_browser_login=True)，token 过期时
+          自动重新登录并持久化，相当于同时完成会话保活；
+        - 配置页保持零网络请求：页面只读快照，本服务保证快照足够新鲜。
+        """
+        for key in (self.ACCOUNT_KEY_P115, self.ACCOUNT_KEY_DIAN115):
+            try:
+                account = self._load_account(key, allow_browser_login=True)
+            except Exception as error:
+                logger.debug(f"自动刷新账户快照失败（{key}）：{error}")
+                continue
+            if not isinstance(account, dict) or not account.get("connected"):
+                continue
+            account["refreshed_at"] = int(time.time())
+            self._save_account_snapshot(key, account)
+        logger.debug("账户快照自动刷新完成")
+
+    def _build_account_refresh_service(self) -> List[Dict[str, Any]]:
+        """构建账户快照自动刷新服务（v1.8.4；间隔 0 表示关闭）。"""
+        minutes = self._account_refresh_minutes
+        if minutes <= 0:
+            return []
+        has_p115 = self._p115_manager is not None and bool((self._cookies or "").strip())
+        has_dian115 = bool(self._dian115_email and self._dian115_password)
+        if not (has_p115 or has_dian115):
+            return []
+        return [{
+            "id": "P115SubSearchAccountRefresh",
+            "name": "账户信息自动刷新",
+            "trigger": "interval",
+            "func": self.account_snapshot_refresh_service,
+            "kwargs": {"minutes": minutes}
+        }]
+
     def get_service(self) -> List[Dict[str, Any]]:
         services = []
 
@@ -2023,6 +2115,9 @@ class P115SubSearch(_PluginBase):
 
         # 癫影会话保活（v1.8.1）：同样独立于主开关，只看自身配置
         services.extend(self._build_dian115_login_service())
+
+        # 账户快照自动刷新（v1.8.4）：配置页「自动刷新」的数据来源
+        services.extend(self._build_account_refresh_service())
 
         if not self._enabled:
             return services
@@ -2206,8 +2301,9 @@ class P115SubSearch(_PluginBase):
 
     # ------------------ API包装（用于 get_api） ------------------
 
-    def api_clear_history(self, apikey: str) -> dict:
-        return self._api_handler.clear_history(apikey)
+    def api_clear_history(self) -> dict:
+        """API: 清空历史记录（鉴权由 MoviePilot 统一 verify_apikey 完成）。"""
+        return self._api_handler.clear_history()
 
     # ------------------ 同步入口（触发条件1） ------------------
 

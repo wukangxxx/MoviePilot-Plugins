@@ -3,7 +3,6 @@ UI配置模块
 负责生成插件的配置表单和详情页面
 """
 from typing import List, Dict, Any, Tuple, Optional
-from app.core.config import settings
 from app.db.subscribe_oper import SubscribeOper
 from app.schemas.types import MediaType
 from app.log import logger
@@ -162,14 +161,13 @@ class UIConfig:
                             'icon': 'mdi-refresh',
                             'title': '刷新账户信息'
                         },
+                        # 官方约定（README FAQ 7）：api 为相对路径（不带斜杠、
+                        # 不带 apikey，鉴权由前端统一附加），参数走 params。
                         'events': {
                             'click': {
-                                'api': (
-                                    f'/plugin/P115SubSearch/refresh_account'
-                                    f'?apikey={settings.API_TOKEN}'
-                                    f'&key={account_key}'
-                                ),
-                                'method': 'post'
+                                'api': 'plugin/P115SubSearch/refresh_account',
+                                'method': 'post',
+                                'params': {'key': account_key}
                             }
                         }
                     }]
@@ -241,6 +239,14 @@ class UIConfig:
                 'props': {'class': 'text-caption text-warning mt-1'},
                 'text': str(account.get('error') or '请填写登录凭证并保存配置')
             })
+
+        # ---- 刷新说明 ----
+        body.append({
+            'component': 'div',
+            'props': {'class': 'text-caption text-medium-emphasis mt-2'},
+            'text': '点击右上角刷新立即拉取；插件也会定时自动刷新。'
+                    '刷新完成后如未立即更新，请重新打开配置页。'
+        })
 
         return {
             'component': 'VRow',
@@ -357,6 +363,24 @@ class UIConfig:
                              'hint': '5段 Cron：分 时 日 月 周；最小间隔 4 小时（低于 4 小时自动回退 30 */4 * * *）。例：30 2,10,18 * * * 表示2点、10点、18点的30分执行',
                              'persistent-hint': True,
                              'clearable': True
+                         }
+                     }]}
+                ]
+            },
+            # 账户信息自动刷新（v1.8.4）
+            {
+                'component': 'VRow',
+                'content': [
+                    {'component': 'VCol', 'props': {'cols': 12, 'md': 4},
+                     'content': [{
+                         'component': 'VTextField',
+                         'props': {
+                             'model': 'account_refresh_minutes',
+                             'label': '账户信息自动刷新间隔（分钟）',
+                             'type': 'number',
+                             'placeholder': '30',
+                             'hint': '每 N 分钟后台自动刷新 115 与癫影账户卡片，癫影同时保活登录态；设为 0 关闭',
+                             'persistent-hint': True
                          }
                      }]}
                 ]
@@ -874,6 +898,7 @@ class UIConfig:
             "onlyonce": False,
             "only_115": True,
             "cron": "30 2,10,18 * * *",
+            "account_refresh_minutes": 30,
 
             "unblock_site_ids": [],
             "unblock_site_names": [],
@@ -1133,7 +1158,7 @@ class UIConfig:
                                     'text': '立即搜索',
                                     'events': {
                                         'click': {
-                                            'api': f'/plugin/P115SubSearch/sync_subscribes?apikey={settings.API_TOKEN}',
+                                            'api': 'plugin/P115SubSearch/sync_subscribes',
                                             'method': 'get'
                                         }
                                     }
@@ -1148,7 +1173,7 @@ class UIConfig:
                                     'text': '清空历史记录',
                                     'events': {
                                         'click': {
-                                            'api': f'/plugin/P115SubSearch/clear_history?apikey={settings.API_TOKEN}',
+                                            'api': 'plugin/P115SubSearch/clear_history',
                                             'method': 'post'
                                         }
                                     }

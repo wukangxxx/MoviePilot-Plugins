@@ -287,9 +287,21 @@ check("5-3 endpoint 指向 api_refresh_account",
 
 refresh_api = method_source(init_src, "P115SubSearch", "api_refresh_account")
 check("5-4 api_refresh_account 已定义", bool(refresh_api), "缺失")
-check("5-5 校验 API Token",
-      "settings.API_TOKEN" in refresh_api,
-      "缺少鉴权")
+# v1.8.4：鉴权移交 MoviePilot 统一 verify_apikey 依赖，handler 不再有 apikey 参数
+# （AST 检查参数列表，避免 docstring 里的字样造成假阳性）
+import ast as _ast
+_params = None
+for _node in _ast.walk(_ast.parse(init_src)):
+    if isinstance(_node, _ast.ClassDef) and _node.name == "P115SubSearch":
+        for _item in _node.body:
+            if isinstance(_item, _ast.FunctionDef) and _item.name == "api_refresh_account":
+                _params = {a.arg for a in _item.args.args} | {a.arg for a in _item.args.kwonlyargs}
+check("5-5 鉴权移交框架（无 apikey 必填参数）",
+      _params is not None and "apikey" not in _params,
+      "handler 不应再有 apikey 参数")
+check("5-5b 缺 key 时明确报错",
+      "缺少账户卡片标识" in refresh_api,
+      "key 参数缺失时应返回明确错误")
 check("5-6 返回 limited 标记",
       '"limited"' in refresh_api,
       "应返回是否被冷却限制")

@@ -147,24 +147,24 @@ if status_src:
               token not in code_body,
               f"❌ 配置页状态采集不得{why}，会拖慢表单渲染")
 
-    check("3-7 使用 login_status（纯本地快照）",
-          "login_status()" in status_src,
-          "应复用 dian115 客户端的本地 login_status()")
+    check("3-7 走本地快照读取器（纯本地，零请求）",
+          "_cached_account_status()" in status_src or "_load_account_snapshot" in status_src,
+          "账户状态应通过本地快照读取器获取，不得直连第三方")
     check("3-8 有异常兜底",
           "except Exception" in status_src,
           "状态采集必须兜底，不能影响表单渲染")
     check("3-9 读取本地缓存而非实时请求",
-          "__read_p115_account_cache" in status_src,
-          "115 状态应读本地缓存快照")
+          "_load_account_snapshot" in init_src,
+          "账户状态应读独立本地快照（v1.8.3 起改为快照层）")
 
-    # 3-10 缓存读写方法成对存在
-    cache_read = method_source(init_src, "P115SubSearch", "__read_p115_account_cache")
-    cache_write = method_source(init_src, "P115SubSearch", "__cache_p115_account")
-    check("3-10 __read_p115_account_cache 已定义", bool(cache_read), "缺失")
-    check("3-11 __cache_p115_account 已定义", bool(cache_write), "缺失")
-    check("3-12 缓存写入复用 get_account_info（仅验证后调用）",
-          "get_account_info" in cache_write and "save_data" in cache_write,
-          "缓存写入应复用已完成的登录结果")
+    # 3-10 快照读写方法成对存在（v1.8.3：由 __read/__cache_p115_account 升级为通用快照层）
+    cache_read = method_source(init_src, "P115SubSearch", "_load_account_snapshot")
+    cache_write = method_source(init_src, "P115SubSearch", "_save_account_snapshot")
+    check("3-10 _load_account_snapshot 已定义", bool(cache_read), "缺失")
+    check("3-11 _save_account_snapshot 已定义", bool(cache_write), "缺失")
+    check("3-12 快照写入复用 get_data/save_data",
+          "save_data" in cache_write and "get_data" in cache_read,
+          "快照读写应走插件数据接口")
 
 print()
 print("=" * 68)
@@ -209,21 +209,23 @@ form_src = method_source(cfg_src, "UIConfig", "get_form")
 check("4-2 get_form 接受 account_status 参数",
       re.search(r"def get_form\(\s*account_status", form_src) is not None,
       "签名缺少 account_status")
-check("4-3 状态卡片在 basic_rows 中插入",
-      "_status_card" in form_src and "basic_rows.append" in form_src,
-      "未插入状态卡片")
-check("4-4 _status_card 方法已定义",
-      "def _status_card" in cfg_src,
-      "缺少 _status_card")
+check("4-3 账户卡片在 basic_rows 中插入",
+      "_account_cards" in form_src and "basic_rows.append" in form_src,
+      "未插入账户卡片")
+check("4-4 _account_card 方法已定义",
+      "def _account_card" in cfg_src,
+      "缺少 _account_card")
 
-card_src = method_source(cfg_src, "UIConfig", "_status_card")
-check("4-5 _status_card 渲染 label/value 两列",
-      "'label': label" in card_src.replace('"label"', "'label'")
-      or "label" in card_src,
-      "缺少 label 渲染")
-check("4-6 _status_card 使用 VCard",
+card_src = method_source(cfg_src, "UIConfig", "_account_card")
+check("4-5 _account_card 渲染 label/value 明细",
+      "label" in card_src and "value" in card_src,
+      "缺少 label/value 明细渲染")
+check("4-6 _account_card 使用 VCard",
       "VCard" in card_src,
       "缺少 VCard 容器")
+check("4-7 卡片带刷新按钮（对齐网盘搜索助手）",
+      "refresh_account" in card_src,
+      "缺少刷新按钮，无法手动拉取账户信息")
 
 print()
 print("=" * 68)

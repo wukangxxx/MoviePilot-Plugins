@@ -2,10 +2,12 @@
 115网盘订阅搜索插件
 结合MoviePilot订阅功能，自动搜索115网盘资源并转存缺失剧集
 """
+import asyncio
+import copy
 import datetime
 import time
 from pathlib import Path
-from threading import Lock
+from threading import Lock, RLock
 from typing import Optional, Any, List, Dict, Tuple
 
 import pytz
@@ -30,6 +32,100 @@ from .utils import download_so_file
 
 lock = Lock()
 
+# ---------------------------------------------------------------------------
+# 账户信息卡片缓存（v1.8.3，移植自网盘搜索助手 core/api/account.py）
+#
+# 三层结构，缺一不可：
+#   1. 内存 TTL 缓存（5 分钟）—— 挡住同一次会话内的重复读取；
+#   2. 刷新冷却守卫（30 秒）—— 挡住用户连点刷新按钮打爆第三方接口；
+#   3. 独立数据库快照 —— 进程重启后配置页仍能秒出上次的账户信息。
+#
+# 用普通 dict + 时间戳实现，不依赖 MoviePilot 的 TTLCache（保持本插件
+# 「零平台内部依赖」的既有约定）。
+# ---------------------------------------------------------------------------
+_ACCOUNT_INFO_TTL_SECONDS = 5 * 60
+_ACCOUNT_REFRESH_COOLDOWN_SECONDS = 30
+_ACCOUNT_INFO_LOCK = RLock()
+# key -> (expire_ts, payload)
+_ACCOUNT_INFO_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+# key -> expire_ts
+_ACCOUNT_REFRESH_GUARD: Dict[str, float] = {}
+
+
+def _account_cache_get(key: str) -> Optional[Dict[str, Any]]:
+    """读内存 TTL 缓存；过期即视为未命中并顺手清理。"""
+    now = time.monotonic()
+    with _ACCOUNT_INFO_LOCK:
+        entry = _ACCOUNT_INFO_CACHE.get(key)
+        if not entry:
+            return None
+        expire_at, payload = entry
+        if expire_at <= now:
+            _ACCOUNT_INFO_CACHE.pop(key, None)
+            return None
+        return copy.deepcopy(payload)
+
+
+def _account_cache_set(key: str, payload: Dict[str, Any]) -> None:
+    """写内存 TTL 缓存。"""
+    with _ACCOUNT_INFO_LOCK:
+        _ACCOUNT_INFO_CACHE[key] = (
+            time.monotonic() + _ACCOUNT_INFO_TTL_SECONDS,
+            copy.deepcopy(payload),
+        )
+
+
+def _account_guard_active(key: str) -> bool:
+    """刷新冷却是否仍在生效。"""
+    now = time.monotonic()
+    with _ACCOUNT_INFO_LOCK:
+        expire_at = _ACCOUNT_REFRESH_GUARD.get(key)
+        if not expire_at:
+            return False
+        if expire_at <= now:
+            _ACCOUNT_REFRESH_GUARD.pop(key, None)
+            return False
+        return True
+
+
+def _account_guard_arm(key: str) -> None:
+    """进入刷新冷却。"""
+    with _ACCOUNT_INFO_LOCK:
+        _ACCOUNT_REFRESH_GUARD[key] = (
+            time.monotonic() + _ACCOUNT_REFRESH_COOLDOWN_SECONDS
+        )
+
+
+def _human_size(value: Any) -> str:
+    """把字节数格式化成可读容量；无法解析时返回「—」。"""
+    try:
+        size = float(value)
+    except (TypeError, ValueError):
+        return "—"
+    if size <= 0:
+        return "—"
+    units = ("B", "KB", "MB", "GB", "TB", "PB")
+    index = 0
+    while size >= 1024 and index < len(units) - 1:
+        size /= 1024.0
+        index += 1
+    if index == 0:
+        return f"{int(size)} {units[index]}"
+    return f"{size:.2f} {units[index]}"
+
+
+def clear_account_cache(account_key: str = "") -> None:
+    """清空账户内存缓存与冷却守卫（发布/调试用）。"""
+    normalized = str(account_key or "").strip().lower()
+    with _ACCOUNT_INFO_LOCK:
+        if normalized:
+            _ACCOUNT_INFO_CACHE.pop(normalized, None)
+            _ACCOUNT_REFRESH_GUARD.pop(normalized, None)
+        else:
+            _ACCOUNT_INFO_CACHE.clear()
+            _ACCOUNT_REFRESH_GUARD.clear()
+
+
 
 class P115SubSearch(_PluginBase):
     """115网盘订阅搜索插件"""
@@ -41,7 +137,7 @@ class P115SubSearch(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/cloud.png"
     # 插件版本
-    plugin_version = "1.8.2"
+    plugin_version = "1.8.3"
     # 插件作者
     plugin_author = "mrtian2016"
     # 作者主页
@@ -1312,7 +1408,38 @@ class P115SubSearch(_PluginBase):
         logger.info(
             f"签到完成：成功 {result.get('success_count')} 项，失败 {result.get('fail_count')} 项"
         )
+        # 用签到结果回写账户快照，避免配置页为拿最新积分再请求一次第三方（v1.8.3）
+        self._sync_account_snapshot_after_checkin(result)
         return result
+
+    def _sync_account_snapshot_after_checkin(self, result: Dict[str, Any]) -> None:
+        """
+        签到完成后，用结果更新账户快照的积分与签到天数（v1.8.3）。
+
+        只改本地快照，**不发任何网络请求**。这样配置页无需为了拿最新积分
+        再打一次第三方接口。
+        """
+        try:
+            for record in list((result or {}).get("records") or []):
+                if not isinstance(record, dict):
+                    continue
+                provider = str(record.get("provider") or "").strip().lower()
+                if not record.get("success"):
+                    continue
+                if provider == "dian115":
+                    self.update_account_points(
+                        self.ACCOUNT_KEY_DIAN115,
+                        record.get("points"),
+                        record.get("days"),
+                    )
+                elif provider == "p115":
+                    self.update_account_points(
+                        self.ACCOUNT_KEY_P115,
+                        record.get("points"),
+                        None,
+                    )
+        except Exception as error:
+            logger.debug(f"签到后回写账户快照失败：{error}")
 
     def checkin_service(self):
         """签到服务入口（供 get_service 注册独立周期使用）。"""
@@ -1362,139 +1489,420 @@ class P115SubSearch(_PluginBase):
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         return UIConfig.get_form(self._collect_account_status())
 
+    # ==================================================================
+    # 账户信息卡片（v1.8.3，移植自网盘搜索助手）
+    #
+    # 产出统一的账户卡片契约，与网盘搜索助手的 AccountInfo 组件一一对应：
+    #     {
+    #       "connected": bool,
+    #       "user": {"name", "avatar", "membership_supported", "badge",
+    #                "is_vip", "vip_label", "vip_expire_date",
+    #                "is_forever_vip"},
+    #       "points": {"label", "available"},
+    #       "storage": {"used", "total", "remaining"},   # 仅网盘
+    #       "details": [{"label", "value"}, ...],
+    #       "error": str,        # connected=False 时给用户看的提示
+    #       "refreshed_at": int, # 快照时间戳
+    #     }
+    #
+    # 数据来源分三条路：
+    #   1. _cached_account_status() —— 配置页专用，**零第三方请求**；
+    #   2. _account_info(key, refresh) —— 手动刷新 / 任务路径，带缓存与冷却；
+    #   3. update_account_points() —— 签到结果回写快照，避免二次请求。
+    # ==================================================================
+
+    # 账户卡片标识：与网盘搜索助手同构（category:source）
+    ACCOUNT_KEY_P115 = "drive:p115"
+    ACCOUNT_KEY_DIAN115 = "search:dian115"
+
+    # 卡片快照落盘键前缀
+    ACCOUNT_SNAPSHOT_PREFIX = "account_snapshot:"
+
+    @staticmethod
+    def _normalize_account_key(account_key: str) -> str:
+        """校验并规范化账户卡片标识。"""
+        normalized = str(account_key or "").strip().lower()
+        if ":" not in normalized:
+            raise ValueError("账户卡片标识无效")
+        category, source = normalized.split(":", 1)
+        if category not in {"drive", "search"} or not source:
+            raise ValueError("账户卡片标识无效")
+        return normalized
+
+    @staticmethod
+    def _account_card_placeholder(error: str) -> Dict[str, Any]:
+        """未连接态卡片。"""
+        return {
+            "connected": False,
+            "user": {},
+            "points": {},
+            "details": [],
+            "error": str(error or "请填写登录凭证并保存配置"),
+        }
+
+    def _p115_account_card(self) -> Dict[str, Any]:
+        """把 115 账户信息转换为通用卡片契约。"""
+        manager = self._p115_manager
+        if manager is None:
+            return self._account_card_placeholder("115 客户端未初始化，请检查 Cookie 配置")
+        if not getattr(manager, "client", None):
+            has_cookie = bool((self._cookies or "").strip())
+            return self._account_card_placeholder(
+                "115 客户端不可用（依赖缺失）" if has_cookie else "请填写 115 Cookie 并保存配置"
+            )
+
+        raw_cookie = (self._cookies or "").strip()
+        missing_keys = [
+            key for key in ("UID", "CID", "SEID", "KID")
+            if not (raw_cookie and f"{key}=" in raw_cookie)
+        ]
+        if missing_keys:
+            return self._account_card_placeholder(
+                f"115 Cookie 不完整，缺少：{'/'.join(missing_keys)}"
+            )
+
+        info = manager.get_account_info()
+        if not isinstance(info, dict) or not info.get("connected"):
+            message = info.get("error") if isinstance(info, dict) else None
+            return self._account_card_placeholder(
+                str(message or "115 账户信息读取失败，请检查 Cookie 或稍后重试")
+            )
+
+        name = str(info.get("name") or "115 用户").strip()
+        vip_name = str(info.get("vip_name") or "").strip()
+        is_vip = bool(info.get("vip"))
+        remain_days = info.get("expire")
+        if is_vip and remain_days:
+            vip_label = f"{vip_name or 'VIP'}（剩余 {int(remain_days)} 天）"
+        elif is_vip:
+            vip_label = vip_name or "VIP"
+        else:
+            vip_label = ""
+
+        details: List[Dict[str, str]] = []
+
+        def add_detail(label: str, value: Any) -> None:
+            text = str(value if value is not None else "").strip()
+            if text and text != "0":
+                details.append({"label": label, "value": text})
+
+        add_detail("会员状态", vip_label or ("VIP" if is_vip else "普通用户"))
+        add_detail("用户 ID", info.get("user_id"))
+        add_detail("状态更新时间", time.strftime(
+            "%Y-%m-%d %H:%M:%S", time.localtime()
+        ))
+
+        storage = {
+            "used": _human_size(info.get("space_used")),
+            "total": _human_size(info.get("space_total")),
+        }
+        if storage["used"] == "—":
+            storage = {}
+
+        return {
+            "connected": True,
+            "user": {
+                "name": name,
+                "avatar": "",
+                "membership_supported": True,
+                "badge": "",
+                "is_vip": is_vip,
+                "vip_label": vip_label,
+                "vip_expire_date": "",
+                "is_forever_vip": False,
+            },
+            "points": {},
+            "storage": storage,
+            "details": details,
+            "refreshed_at": int(time.time()),
+        }
+
+    def _dian115_account_card(self) -> Dict[str, Any]:
+        """把癫影账户信息转换为通用卡片契约。"""
+        client = self._dian115_client
+        if client is None:
+            if not self._dian115_enabled and not self._dian115_checkin_enabled:
+                return self._account_card_placeholder("癫影未启用")
+            if not self._dian115_email or not self._dian115_password:
+                return self._account_card_placeholder("请填写癫影邮箱和密码并保存配置")
+            return self._account_card_placeholder(
+                "癫影客户端未初始化（缺少账号密码或浏览器环境不可用）"
+            )
+
+        status = client.login_status() or {}
+        if not status.get("has_token") and not status.get("auto_login"):
+            return self._account_card_placeholder("癫影未登录，请填写账号密码或手工 Token")
+
+        info = client.get_account_info()
+        if not isinstance(info, dict):
+            return self._account_card_placeholder("癫影账户信息读取失败，请稍后重试")
+        if info.get("error") and not info.get("points") and not info.get("name"):
+            return self._account_card_placeholder(str(info.get("error")))
+
+        name = str(info.get("name") or "").strip()
+        email = str(info.get("email") or "").strip().lower()
+        if not name or "@" in name or (email and name.lower() == email):
+            name = "Dian115 用户"
+
+        details: List[Dict[str, str]] = []
+
+        def add_detail(label: str, value: Any) -> None:
+            text = str(value if value is not None else "").strip()
+            if text:
+                details.append({"label": label, "value": text})
+
+        add_detail("会员状态", "VIP" if info.get("is_vip") else "普通用户")
+        add_detail("连续签到", f"{int(info.get('consecutive_signin') or 0)} 天")
+        add_detail("已解锁", f"{int(info.get('unlock_count') or 0)} 次")
+
+        auth_mode = "手工 Token"
+        if not status.get("has_token"):
+            auth_mode = "自动登录"
+        add_detail("认证方式", auth_mode)
+
+        return {
+            "connected": True,
+            "user": {
+                "name": name,
+                "avatar": str(info.get("avatar") or ""),
+                "membership_supported": True,
+                "badge": str(info.get("role") or "").strip(),
+                "is_vip": bool(info.get("is_vip")),
+                "vip_label": str(info.get("vip_until") or "").strip(),
+                "vip_expire_date": "",
+                "is_forever_vip": False,
+            },
+            "points": {
+                "label": "可用积分",
+                "available": max(0, int(info.get("points") or 0)),
+            },
+            "details": details,
+            "refreshed_at": int(time.time()),
+        }
+
+    # ---- 快照读写（独立数据库键，与网盘搜索助手 load_account/save_account 同义） ----
+
+    def _load_account_snapshot(self, account_key: str) -> Dict[str, Any]:
+        """读取账户快照（内存缓存 → 落盘快照 → 空）。"""
+        try:
+            normalized = self._normalize_account_key(account_key)
+        except ValueError:
+            return {}
+        cached = _account_cache_get(normalized)
+        if cached:
+            return cached
+        try:
+            stored = self.get_data(f"{self.ACCOUNT_SNAPSHOT_PREFIX}{normalized}")
+        except Exception as error:
+            logger.debug(f"读取账户快照失败（{normalized}）：{error}")
+            return {}
+        if isinstance(stored, dict) and stored:
+            _account_cache_set(normalized, stored)
+            return stored
+        return {}
+
+    def _save_account_snapshot(self, account_key: str, account: Dict[str, Any]) -> None:
+        """写入账户快照（内存缓存 + 落盘）。"""
+        try:
+            normalized = self._normalize_account_key(account_key)
+        except ValueError:
+            return
+        _account_cache_set(normalized, account)
+        try:
+            self.save_data(
+                f"{self.ACCOUNT_SNAPSHOT_PREFIX}{normalized}",
+                copy.deepcopy(account),
+            )
+        except Exception as error:
+            logger.debug(f"保存账户快照失败（{normalized}）：{error}")
+
+    # ---- 核心：读卡片（带缓存与冷却） ----
+
+    def _load_account(self, account_key: str) -> Dict[str, Any]:
+        """真正去取一次账户信息（会发网络请求）。"""
+        normalized = self._normalize_account_key(account_key)
+        if normalized == self.ACCOUNT_KEY_P115:
+            return self._p115_account_card()
+        if normalized == self.ACCOUNT_KEY_DIAN115:
+            return self._dian115_account_card()
+        raise ValueError(f"不支持的账户卡片：{normalized}")
+
+    def _account_info(self, account_key: str, refresh: bool = False) -> Tuple[Dict[str, Any], bool]:
+        """
+        读取单卡片信息，使用独立快照并实施刷新冷却。
+
+        :return: (account, limited)；limited=True 表示因冷却未真正刷新
+        """
+        normalized = self._normalize_account_key(account_key)
+        snapshot = self._load_account_snapshot(normalized)
+
+        if refresh and _account_guard_active(normalized):
+            return snapshot or self._account_card_placeholder("账户信息正在冷却，请稍后再刷新"), True
+        if not refresh and snapshot:
+            return snapshot, False
+
+        _account_guard_arm(normalized)
+        try:
+            account = self._load_account(normalized)
+        except Exception as error:
+            logger.debug(f"读取账户信息失败（{normalized}）：{error}")
+            account = self._account_card_placeholder("账户信息读取失败，请检查登录凭据或稍后重试")
+        account["refreshed_at"] = int(time.time())
+        self._save_account_snapshot(normalized, account)
+        return account, False
+
+    def _cached_account_status(self) -> Dict[str, Any]:
+        """
+        配置页专用只读路径：只读内存缓存与落盘快照，**绝不访问第三方接口**。
+
+        翻配置页是高频操作，绝不能触发浏览器冷启动或 HTTP 请求。
+        没有快照时返回占位卡片，由用户点「刷新」按钮主动拉取。
+        """
+        cards: List[Dict[str, Any]] = []
+        for account_key, title, placeholder in (
+            (self.ACCOUNT_KEY_P115, "115 网盘",
+             self._p115_account_card_placeholder()),
+            (self.ACCOUNT_KEY_DIAN115, "癫影",
+             self._dian115_account_card_placeholder()),
+        ):
+            account = self._load_account_snapshot(account_key)
+            if not account:
+                account = placeholder
+                account.setdefault("refreshed_at", 0)
+            cards.append({"key": account_key, "title": title, "account": account})
+        return {"cards": cards}
+
+    def _p115_account_card_placeholder(self) -> Dict[str, Any]:
+        """115 卡片的未连接占位（不发请求）。"""
+        if self._p115_manager is None:
+            return self._account_card_placeholder("115 客户端未初始化，请检查 Cookie 配置")
+        if not getattr(self._p115_manager, "client", None):
+            has_cookie = bool((self._cookies or "").strip())
+            return self._account_card_placeholder(
+                "115 客户端不可用（依赖缺失）" if has_cookie else "请填写 115 Cookie 并保存配置"
+            )
+        return self._account_card_placeholder("点击右上角刷新获取 115 账户信息")
+
+    def _dian115_account_card_placeholder(self) -> Dict[str, Any]:
+        """癫影卡片的未连接占位（不发请求）。"""
+        if self._dian115_client is None:
+            if not self._dian115_enabled and not self._dian115_checkin_enabled:
+                return self._account_card_placeholder("癫影未启用")
+            if not self._dian115_email or not self._dian115_password:
+                return self._account_card_placeholder("请填写癫影邮箱和密码并保存配置")
+            return self._account_card_placeholder("癫影客户端未初始化（浏览器环境不可用）")
+        return self._account_card_placeholder("点击右上角刷新获取癫影账户信息")
+
     def _collect_account_status(self) -> Dict[str, Any]:
         """
-        采集 115 网盘与癫影的登录状态，供配置页顶部状态卡片展示（v1.8.2 新增）。
+        采集账户卡片，供配置页渲染（v1.8.3 改为网盘搜索助手的卡片契约）。
 
-        设计要点：
-        - **只读本地状态，不发网络请求**。翻配置页是高频操作，绝不能触发
-          浏览器冷启动或第三方接口调用（否则配置页会被拖慢）。
-        - 任何异常都降级为「未知」，不允许影响配置表单渲染。
+        **只读本地快照，不发网络请求**。任何异常都降级为占位卡片，
+        绝不允许影响配置表单渲染。
         """
-        rows: List[Dict[str, str]] = []
-        level = "info"
-
-        # ---- 癫影（Dian115）----
         try:
-            client = self._dian115_client
-            if client is None:
-                if not self._dian115_enabled and not self._dian115_checkin_enabled:
-                    rows.append({"label": "癫影", "value": "未启用"})
-                elif not self._dian115_email or not self._dian115_password:
-                    rows.append({"label": "癫影", "value": "缺少账号密码"})
-                    level = "warning"
-                else:
-                    rows.append({"label": "癫影", "value": "客户端未初始化"})
-                    level = "warning"
-            else:
-                status = client.login_status()
-                auth_mode = "未配置"
-                if status.get("has_token"):
-                    remain = status.get("token_remaining_hours")
-                    auth_mode = f"手工 Token（剩余约 {remain} 小时）" if remain else "手工 Token"
-                elif status.get("auto_login"):
-                    auth_mode = (
-                        "自动登录（浏览器可用）" if status.get("browser_available")
-                        else f"自动登录不可用：{status.get('browser_error') or '浏览器环境缺失'}"
-                    )
-                    if not status.get("browser_available"):
-                        level = "warning"
-                rows.append({"label": "癫影认证方式", "value": auth_mode})
-                rows.append({
-                    "label": "癫影账号",
-                    "value": str(status.get("email") or "未填写"),
-                })
-                rows.append({
-                    "label": "癫影积分解锁",
-                    "value": "已开启" if self._dian115_auto_unlock else "已关闭",
-                })
-        except Exception as error:  # 状态展示绝不能影响表单
-            logger.debug(f"采集癫影登录状态失败：{error}")
-            rows.append({"label": "癫影", "value": "状态读取失败"})
-
-        # ---- 115 网盘 ----
-        try:
-            manager = self._p115_manager
-            if manager is None:
-                rows.append({"label": "115 网盘", "value": "客户端未初始化"})
-                level = "warning"
-            elif not getattr(manager, "client", None):
-                has_cookie = bool((self._cookies or "").strip())
-                rows.append({
-                    "label": "115 网盘",
-                    "value": "未配置 Cookie" if not has_cookie else "客户端不可用（依赖缺失）",
-                })
-                level = "warning"
-            else:
-                # 只读本地 Cookie 快照，**不调用 get_account_info()**（那会发 HTTP 请求）。
-                # 配置页是高频入口，必须保持零网络开销。
-                raw_cookie = (self._cookies or "").strip()
-                cookie_keys = {
-                    key: bool(raw_cookie and f"{key}=" in raw_cookie)
-                    for key in ("UID", "CID", "SEID", "KID")
-                }
-                missing_keys = [k for k, ok in cookie_keys.items() if not ok]
-                cached = self.__read_p115_account_cache()
-                if cached and cached.get("connected"):
-                    rows.append({"label": "115 账号", "value": str(cached.get("name") or "已登录")})
-                    rows.append({
-                        "label": "会员状态",
-                        "value": str(cached.get("vip_name") or ("VIP" if cached.get("vip") else "普通用户")),
-                    })
-                    rows.append({"label": "状态更新时间", "value": str(cached.get("checked_at") or "—")})
-                elif missing_keys:
-                    rows.append({
-                        "label": "115 网盘",
-                        "value": f"Cookie 不完整，缺少：{'/'.join(missing_keys)}",
-                    })
-                    level = "error"
-                else:
-                    rows.append({"label": "115 网盘", "value": "Cookie 已配置（登录态待验证）"})
+            return self._cached_account_status()
         except Exception as error:
-            logger.debug(f"采集 115 登录状态失败：{error}")
-            rows.append({"label": "115 网盘", "value": "状态读取失败"})
+            logger.debug(f"采集账户状态失败：{error}")
+            return {"cards": []}
 
-        # 有任一未就绪即降级配色，便于一眼发现问题
-        if level == "info" and any(
-                "未登录" in r["value"] or "未配置" in r["value"]
-                or "失败" in r["value"] or "不完整" in r["value"]
-                for r in rows
-        ):
-            level = "warning"
-
-        return {"title": "账户登录状态", "rows": rows, "type": level}
-
-    def __read_p115_account_cache(self) -> Dict[str, Any]:
-        """
-        读取上一次成功验证的 115 账户快照（纯本地缓存，零网络开销）。
-
-        v1.8.2 新增：由 check_login / 任务执行路径写入，供配置页展示。
-        """
+    def refresh_account(self, account_key: str) -> Tuple[Dict[str, Any], bool]:
+        """同步刷新单个账户卡片（供 API 路由用 asyncio.to_thread 调用）。"""
+        account, limited = self._account_info(account_key, True)
+        normalized = self._normalize_account_key(account_key)
+        # 快照变化后清掉配置页的 options 缓存，下次打开即可见新值
         try:
-            cached = self.get_data("p115_account_cache")
-            return cached if isinstance(cached, dict) else {}
+            clear_account_cache(normalized)
         except Exception:
-            return {}
+            pass
+        return account, limited
 
-    def __cache_p115_account(self) -> None:
+    def update_account_points(
+            self, account_key: str, points: Any, signin_days: Any = None
+    ) -> bool:
         """
-        登录验证成功后落盘 115 账户快照，供配置页展示（v1.8.2 新增）。
+        用签到结果更新账户快照，避免配置页重复请求第三方接口。
 
-        仅在已经完成一次真实登录校验后调用，因此不会引入额外请求。
+        只改 points.available 与 details 里的「累计签到 / 连续签到」项。
         """
         try:
-            info = self._p115_manager.get_account_info() if self._p115_manager else {}
-            if not isinstance(info, dict) or not info.get("connected"):
-                return
-            info = dict(info)
-            info["checked_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-            # 只保留展示所需字段，避免把敏感信息写进配置快照
-            info.pop("space_used", None)
-            info.pop("space_total", None)
-            self.save_data("p115_account_cache", info)
-        except Exception as error:
-            logger.debug(f"缓存 115 账户快照失败：{error}")
+            normalized = self._normalize_account_key(account_key)
+        except ValueError:
+            return False
+        try:
+            normalized_points = max(0, int(points))
+        except (TypeError, ValueError):
+            return False
+        try:
+            normalized_days = (
+                max(0, int(signin_days)) if signin_days is not None else None
+            )
+        except (TypeError, ValueError):
+            normalized_days = None
 
+        account = self._load_account_snapshot(normalized)
+        if not isinstance(account, dict) or not account.get("connected"):
+            return False
+
+        account = copy.deepcopy(account)
+        point_info = dict(account.get("points") or {})
+        point_info.setdefault("label", "可用积分")
+        point_info["available"] = normalized_points
+        account["points"] = point_info
+
+        if normalized_days is not None:
+            details = list(account.get("details") or [])
+            for item in details:
+                if (
+                        isinstance(item, dict)
+                        and item.get("label") in {"累计签到", "连续签到"}
+                ):
+                    item["value"] = f"{normalized_days} 天"
+                    break
+            account["details"] = details
+
+        account["refreshed_at"] = int(time.time())
+        self._save_account_snapshot(normalized, account)
+        return True
+
+    def api_refresh_account(self, apikey: str, key: str = "") -> dict:
+        """手动刷新单个账户信息卡片（插件 API 路由）。"""
+        if apikey != settings.API_TOKEN:
+            return {"success": False, "message": "API 密钥错误"}
+        account_key = str(key or "").strip()
+        if not account_key:
+            return {"success": False, "message": "缺少账户卡片标识"}
+        try:
+            account, limited = self.refresh_account(account_key)
+        except ValueError as error:
+            return {"success": False, "message": str(error)}
+        except Exception as error:
+            logger.error(f"刷新账户信息失败：{error}")
+            return {"success": False, "message": f"刷新账户信息失败：{error}"}
+        normalized = self._normalize_account_key(account_key)
+        return {
+            "success": True,
+            "message": "刷新过于频繁，已显示最近一次账户信息" if limited else "账户信息已刷新",
+            "data": {
+                "key": normalized,
+                "account": account,
+                "limited": limited,
+            },
+        }
+
+    def _refresh_p115_account_snapshot(self) -> None:
+        """
+        登录校验通过后刷新 115 账户快照，供配置页展示（v1.8.3）。
+
+        复用刚完成的 check_login 结果，因此不会额外引入一次登录请求。
+        """
+        try:
+            account = self._p115_account_card()
+            if not account.get("connected"):
+                return
+            self._save_account_snapshot(self.ACCOUNT_KEY_P115, account)
+        except Exception as error:
+            logger.debug(f"刷新 115 账户快照失败：{error}")
 
     def get_page(self) -> Optional[List[dict]]:
         history = self.get_data('history') or []
@@ -1513,6 +1921,12 @@ class P115SubSearch(_PluginBase):
                 "endpoint": self.api_clear_history,
                 "methods": ["POST"],
                 "summary": "清空历史记录"
+            },
+            {
+                "path": "/refresh_account",
+                "endpoint": self.api_refresh_account,
+                "methods": ["POST"],
+                "summary": "刷新账户信息卡片"
             }
         ]
     
@@ -1682,7 +2096,8 @@ class P115SubSearch(_PluginBase):
                 )
             return False
 
-        self.__cache_p115_account()
+        # 登录校验已通过，刷新一次 115 账户快照供配置页展示（v1.8.3）
+        self._refresh_p115_account_snapshot()
         logger.info("开始执行 115 网盘订阅同步...")
         if self._notify:
             self.post_message(

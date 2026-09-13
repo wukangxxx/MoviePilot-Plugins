@@ -76,30 +76,172 @@ class UIConfig:
         }
 
     @staticmethod
-    def _status_card(title: str, rows: List[Dict[str, str]], atype: str = 'info') -> Dict[str, Any]:
+    def _account_card(entry: Dict[str, Any]) -> Dict[str, Any]:
         """
-        生成一张只读状态卡片（label / value 两列）。
+        渲染一张账户信息卡片（v1.8.3，对齐网盘搜索助手的 AccountInfo 组件）。
 
-        :param title: 卡片标题
-        :param rows: [{'label': ..., 'value': ...}, ...]
-        :param atype: 卡片配色 —— info / success / warning / error
+        卡片结构：
+            头像 + 用户名 + Badge + VIP chip + 刷新按钮
+            积分行（有积分时）
+            容量行（网盘卡片）
+            两列 details 网格（有 details 时）
+            未连接时显示红色提示文案
+
+        :param entry: {"key": "drive:p115", "title": "115 网盘", "account": {...}}
         """
-        items: List[Dict[str, Any]] = []
-        for item in rows:
-            label = str(item.get('label') or '')
-            value = str(item.get('value') or '—')
-            items.append({
-                'component': 'VCol',
-                'props': {'cols': 12, 'md': 4},
-                'content': [{
-                    'component': 'VSheet',
-                    'props': {'color': 'surface', 'rounded': 'lg', 'border': True, 'class': 'pa-3 h-100'},
-                    'content': [
-                        {'component': 'div', 'props': {'class': 'text-caption text-medium-emphasis'}, 'text': label},
-                        {'component': 'div', 'props': {'class': 'text-body-1 font-weight-medium mt-1'}, 'text': value},
-                    ]
-                }]
+        account = entry.get('account') if isinstance(entry.get('account'), dict) else {}
+        account_key = str(entry.get('key') or '')
+        title = str(entry.get('title') or '账户')
+
+        user = account.get('user') if isinstance(account.get('user'), dict) else {}
+        points = account.get('points') if isinstance(account.get('points'), dict) else {}
+        storage = account.get('storage') if isinstance(account.get('storage'), dict) else {}
+        details = account.get('details') if isinstance(account.get('details'), list) else []
+        connected = bool(account.get('connected'))
+
+        # ---- 标题行：账号名 + Badge + VIP chip + 刷新按钮 ----
+        heading: List[Dict[str, Any]] = []
+
+        name_text = str(user.get('name') or '').strip()
+        if not connected:
+            name_text = f'{title}：账号未连接'
+        elif not name_text:
+            name_text = '未知用户'
+        heading.append({
+            'component': 'div',
+            'props': {'class': 'text-body-1 font-weight-medium'},
+            'text': name_text
+        })
+
+        badge = str(user.get('badge') or '').strip()
+        if connected and badge:
+            heading.append({
+                'component': 'VChip',
+                'props': {'color': 'primary', 'size': 'x-small', 'variant': 'tonal', 'class': 'ml-2'},
+                'text': badge
             })
+
+        if connected and user.get('membership_supported') is not False:
+            is_vip = bool(user.get('is_vip'))
+            vip_text = str(user.get('vip_label') or '').strip()
+            if not vip_text:
+                vip_text = 'VIP' if is_vip else '非VIP'
+            heading.append({
+                'component': 'VChip',
+                'props': {
+                    'color': 'amber-darken-2' if is_vip else 'grey',
+                    'size': 'x-small',
+                    'variant': 'tonal',
+                    'class': 'ml-1'
+                },
+                'text': vip_text
+            })
+
+        heading_row: Dict[str, Any] = {
+            'component': 'VRow',
+            'props': {'dense': True, 'align': 'center'},
+            'content': [
+                {
+                    'component': 'VCol',
+                    'props': {'cols': 12, 'md': 10},
+                    'content': [{
+                        'component': 'div',
+                        'props': {'class': 'd-flex align-center flex-wrap ga-1'},
+                        'content': heading
+                    }]
+                },
+                {
+                    'component': 'VCol',
+                    'props': {'cols': 12, 'md': 2, 'class': 'text-right'},
+                    'content': [{
+                        'component': 'VBtn',
+                        'props': {
+                            'size': 'small',
+                            'variant': 'text',
+                            'color': 'primary',
+                            'icon': 'mdi-refresh',
+                            'title': '刷新账户信息'
+                        },
+                        'events': {
+                            'click': {
+                                'api': (
+                                    f'/plugin/P115SubSearch/refresh_account'
+                                    f'?apikey={settings.API_TOKEN}'
+                                    f'&key={account_key}'
+                                ),
+                                'method': 'post'
+                            }
+                        }
+                    }]
+                }
+            ]
+        }
+
+        body: List[Dict[str, Any]] = [heading_row]
+
+        # ---- 积分行 ----
+        available = points.get('available')
+        if connected and available is not None:
+            try:
+                points_text = f"{int(available):,}"
+            except (TypeError, ValueError):
+                points_text = str(available)
+            body.append({
+                'component': 'div',
+                'props': {'class': 'text-caption text-medium-emphasis mt-1'},
+                'text': f"{str(points.get('label') or '可用积分')}：{points_text}"
+            })
+
+        # ---- 容量行（网盘）----
+        used = str(storage.get('used') or '').strip()
+        total = str(storage.get('total') or '').strip()
+        if connected and (used or total):
+            body.append({
+                'component': 'div',
+                'props': {'class': 'text-caption text-medium-emphasis mt-1'},
+                'text': f"已用 {used or '未知'} / {total or '未知'}"
+            })
+
+        # ---- details 两列网格 ----
+        if connected and details:
+            cells: List[Dict[str, Any]] = []
+            for item in details:
+                if not isinstance(item, dict):
+                    continue
+                cells.append({
+                    'component': 'VCol',
+                    'props': {'cols': 12, 'md': 6},
+                    'content': [{
+                        'component': 'div',
+                        'props': {'class': 'd-flex justify-space-between text-caption'},
+                        'content': [
+                            {
+                                'component': 'span',
+                                'props': {'class': 'text-medium-emphasis'},
+                                'text': str(item.get('label') or '')
+                            },
+                            {
+                                'component': 'span',
+                                'props': {'class': 'font-weight-medium text-right'},
+                                'text': str(item.get('value') or '—')
+                            }
+                        ]
+                    }]
+                })
+            body.append({
+                'component': 'VRow',
+                'props': {'dense': True, 'class': 'mt-2 pt-2 account-details-grid'},
+                'content': cells
+            })
+
+        # ---- 未连接提示 ----
+        if not connected:
+            body.append({
+                'component': 'div',
+                'props': {'class': 'text-caption text-warning mt-1'},
+                'text': str(account.get('error') or '请填写登录凭证并保存配置')
+            })
+
         return {
             'component': 'VRow',
             'content': [{
@@ -107,16 +249,34 @@ class UIConfig:
                 'props': {'cols': 12},
                 'content': [{
                     'component': 'VCard',
-                    'props': {'variant': 'tonal', 'color': atype, 'rounded': 'lg'},
+                    'props': {
+                        'variant': 'tonal',
+                        'color': 'success' if connected else 'warning',
+                        'rounded': 'lg'
+                    },
                     'content': [{
                         'component': 'VCardText',
                         'props': {'class': 'py-3'},
-                        'content': [
-                            {'component': 'div', 'props': {'class': 'text-subtitle-2 mb-2'}, 'text': title},
-                            {'component': 'VRow', 'content': items},
-                        ]
+                        'content': body
                     }]
                 }]
+            }]
+        }
+
+    @staticmethod
+    def _account_cards(account_status: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """把账户状态快照渲染成一组账户卡片（v1.8.3）。"""
+        cards = []
+        if account_status:
+            for entry in list(account_status.get('cards') or []):
+                if isinstance(entry, dict):
+                    cards.append(UIConfig._account_card(entry))
+        return {
+            'component': 'VRow',
+            'content': [{
+                'component': 'VCol',
+                'props': {'cols': 12},
+                'content': cards
             }]
         }
 
@@ -154,10 +314,14 @@ class UIConfig:
             其下按「订阅 / 签到 / 盘搜 / 癫影 / 影巢 / 金山文档」分 Tab 管理
 
         v1.8.2 新增：
-            account_status 传入后，在主界面顶部渲染「账户登录状态」卡片，
-            用于直观确认 115 网盘 / 癫影的登录态、积分与有效期。
+            account_status 传入后，在主界面顶部渲染账户状态卡片。
 
-        :param account_status: 由插件实例采集的登录状态快照，可为 None
+        v1.8.3 改版：
+            账户卡片改为网盘搜索助手的 AccountInfo 契约
+            （头像 + Badge + VIP chip + 积分 + 两列 details 网格 + 刷新按钮），
+            115 网盘与癫影各一张，只读本地快照、零第三方请求。
+
+        :param account_status: 由插件实例采集的账户状态快照，可为 None
         :return: (表单schema, 默认配置)
         """
         subscribe_options = UIConfig.get_subscribe_options()
@@ -166,13 +330,9 @@ class UIConfig:
         # ============ 主界面：插件基本功能配置 ============
         basic_rows: List[Dict[str, Any]] = []
 
-        # 登录状态卡片（v1.8.2：115 网盘 + 癫影）
+        # 账户信息卡片（v1.8.3：115 网盘 + 癫影，对齐网盘搜索助手）
         if account_status:
-            basic_rows.append(UIConfig._status_card(
-                str(account_status.get('title') or '账户登录状态'),
-                list(account_status.get('rows') or []),
-                str(account_status.get('type') or 'info'),
-            ))
+            basic_rows.append(UIConfig._account_cards(account_status))
 
         basic_rows.extend([
             # 基本开关 + 执行周期
@@ -421,10 +581,10 @@ class UIConfig:
                     {'component': 'VCol', 'props': {'cols': 12, 'md': 3},
                      'content': [{'component': 'VTextField', 'props': {
                          'model': 'dian115_lottery_count',
-                         'label': '转盘次数',
+                         'label': '转盘目标次数（当日）',
                          'type': 'number',
                          'placeholder': '0',
-                         'hint': '每次签到最多转 20 次，超出自动收敛',
+                         'hint': '当日累计目标：例如设为 5，当天已抽 3 次则本次再抽 2 次；上限 20 次',
                          'persistent-hint': True
                      }}]}
                 ]

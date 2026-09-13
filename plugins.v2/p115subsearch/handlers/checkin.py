@@ -225,13 +225,22 @@ class CheckinHandler:
         if signin_points is None:
             signin_points = points_after - points_before - int(lottery.get("points_change") or 0)
 
+        # 转盘次数口径（v1.8.3 修正，对齐网盘搜索助手）：
+        #   used_after  = 当日累计已用次数（含本次）
+        #   executed    = 本次执行次数（增量）
+        #   target_count= 配置的当日总目标
+        # 历史版本误把 executed 当作进度显示，导致「当天已抽过 3 次、本次再抽 2 次」
+        # 时显示成 2/5，看起来像少抽了。
+        used_after = int(lottery.get("used_after") or 0)
+        lottery_target = int(lottery.get("target_count") or lottery_count or 0)
+        lottery_max_plays = int(lottery.get("max_plays") or 0)
+        lottery_executed = int(lottery.get("executed") or 0)
+
         parts = [
             "今日已签到" if signin.get("already_checked_in") else f"签到 {signin_points} 积分"
         ]
         if lottery_count:
-            parts.append(
-                f"转盘 {lottery.get('used_after') or 0}/{lottery.get('target_count') or lottery_count}"
-            )
+            parts.append(f"转盘 当日 {used_after}/{lottery_target} 次")
         if not lottery.get("success"):
             parts.append(f"转盘未完成：{lottery.get('message') or '接口返回失败'}")
 
@@ -246,13 +255,14 @@ class CheckinHandler:
             "points": int(points_after),
             "points_change": points_after - points_before,
             "days": int(after.get("consecutive_signin") or signin.get("signin_days") or 0),
-            "lottery": {
-                "target": lottery.get("target_count") or lottery_count,
-                "executed": int(lottery.get("executed") or 0),
-                "cost_points": int(lottery.get("cost_points") or 0),
-                "award_points": int(lottery.get("award_points") or 0),
-                "vip_days": int(lottery.get("vip_days") or 0)
-            }
+            # 扁平化转盘字段，与网盘搜索助手 _build_record 保持一致
+            "lottery_target_count": lottery_target,
+            "lottery_executed": lottery_executed,
+            "lottery_used_after": used_after,
+            "lottery_max_plays": lottery_max_plays,
+            "lottery_cost_points": int(lottery.get("cost_points") or 0),
+            "lottery_award_points": int(lottery.get("award_points") or 0),
+            "lottery_vip_days": int(lottery.get("vip_days") or 0),
         })
         return record
 

@@ -381,8 +381,15 @@ check("C2-4 一成一败", r3["success_count"] == 1 and r3["fail_count"] == 1,
       f"actual={r3}")
 
 dian_rec = [r for r in r3["records"] if r["provider"] == "dian115"][0]
-check("C4-1 dian115 记录含转盘明细",
-      isinstance(dian_rec.get("lottery"), dict) and dian_rec["lottery"]["target"] == 1,
+# v1.8.3：转盘字段由嵌套 lottery 改为扁平 lottery_* 字段（对齐网盘搜索助手 _build_record）
+check("C4-1 dian115 记录含转盘明细（扁平字段）",
+      dian_rec.get("lottery_target_count") == 1
+      and "lottery_executed" in dian_rec
+      and "lottery_used_after" in dian_rec,
+      f"actual={dian_rec}")
+check("C4-1b 转盘进度取当日累计（used_after）而非本次增量",
+      dian_rec.get("lottery_used_after") is not None
+      and "当日" in str(dian_rec.get("message") or ""),
       f"actual={dian_rec}")
 check("C4-2 dian115 记录成功", dian_rec["success"] is True, f"actual={dian_rec}")
 

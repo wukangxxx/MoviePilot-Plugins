@@ -754,56 +754,7 @@ class UIConfig:
             }
         ]
 
-        # ============ Tab 5：影巢（已失效） ============
-        hdhive_tab: List[Dict[str, Any]] = [
-            UIConfig._alert('影巢（HDHive）站点已停止服务，相关配置项保留仅供兼容，'
-                            '即使勾选也不会参与搜索调度。建议启用「盘搜」或「癫影」作为搜索源。', 'error'),
-            {
-                'component': 'VRow',
-                'content': [
-                    {'component': 'VCol', 'props': {'cols': 12, 'md': 4},
-                     'content': [{'component': 'VSwitch', 'props': {'model': 'hdhive_enabled', 'label': '启用 HDHive（已失效）'}}]},
-                    {'component': 'VCol', 'props': {'cols': 12, 'md': 4},
-                     'content': [{'component': 'VSelect', 'props': {'model': 'hdhive_query_mode', 'label': '查询模式',
-                         'items': [{'title': 'API 模式', 'value': 'api'}, {'title': 'Playwright 模式', 'value': 'playwright'}]}}]},
-                    {'component': 'VCol', 'props': {'cols': 12, 'md': 4},
-                     'content': [{'component': 'VTextField', 'props': {'model': 'hdhive_client_id', 'label': 'HDHive Client ID', 'placeholder': 'OpenAPI 应用公开 ID（app_xxx）', 'clearable': True}}]}
-                ]
-            },
-            {
-                'component': 'VRow',
-                'content': [
-                    {'component': 'VCol', 'props': {'cols': 12, 'md': 4},
-                     'content': [{'component': 'VTextField', 'props': {'model': 'hdhive_api_key', 'label': 'HDHive 应用 Secret', 'type': 'password', 'placeholder': 'OpenAPI 应用 Secret（X-API-Key）', 'clearable': True}}]},
-                    {'component': 'VCol', 'props': {'cols': 12, 'md': 4},
-                     'content': [{'component': 'VTextField', 'props': {'model': 'hdhive_redirect_uri', 'label': '回调地址', 'placeholder': '须与 OpenAPI 应用配置完全一致', 'clearable': True}}]},
-                    {'component': 'VCol', 'props': {'cols': 12, 'md': 4},
-                     'content': [{'component': 'VTextField', 'props': {'model': 'hdhive_auth_code', 'label': '授权码', 'placeholder': '授权后回调地址中的 code 参数', 'hint': '一次性使用，换取 Token 成功后自动清空', 'persistent-hint': True, 'clearable': True}}]}
-                ]
-            },
-            {
-                'component': 'VRow',
-                'content': [
-                    {'component': 'VCol', 'props': {'cols': 12, 'md': 4},
-                     'content': [{'component': 'VTextField', 'props': {'model': 'hdhive_username', 'label': 'HDHive 用户名', 'placeholder': 'Playwright 模式下需要'}}]},
-                    {'component': 'VCol', 'props': {'cols': 12, 'md': 4},
-                     'content': [{'component': 'VTextField', 'props': {'model': 'hdhive_password', 'label': 'HDHive 密码', 'type': 'password', 'placeholder': 'Playwright 模式下需要', 'clearable': True}}]},
-                    {'component': 'VCol', 'props': {'cols': 12, 'md': 4},
-                     'content': [{'component': 'VSwitch', 'props': {'model': 'hdhive_auto_unlock', 'label': '自动解锁资源', 'hint': '关闭时仅查询免费资源'}}]}
-                ]
-            },
-            {
-                'component': 'VRow',
-                'content': [
-                    {'component': 'VCol', 'props': {'cols': 12, 'md': 6},
-                     'content': [{'component': 'VTextField', 'props': {'model': 'hdhive_max_unlock_points', 'label': '累计解锁总预算', 'type': 'number', 'placeholder': '50', 'hint': '一次任务最多允许消耗的积分总和'}}]},
-                    {'component': 'VCol', 'props': {'cols': 12, 'md': 6},
-                     'content': [{'component': 'VTextField', 'props': {'model': 'hdhive_max_points_per_sub', 'label': '单订阅解锁预算', 'type': 'number', 'placeholder': '20', 'hint': '处理单个订阅时允许消耗的最大积分'}}]}
-                ]
-            }
-        ]
-
-        # ============ Tab 6：金山文档 ============
+        # ============ Tab 5：金山文档 ============
         kdocs_tab: List[Dict[str, Any]] = [
             UIConfig._alert('KDocs在线文档库：读取金山文档在线表格中的资源分享信息并匹配网盘链接。'
                             '需配置 Skill Token；留空文档链接时使用默认文档库。'),
@@ -872,7 +823,6 @@ class UIConfig:
                             {'component': 'VTab', 'props': {'value': 'checkin_tab'}, 'text': '签到'},
                             {'component': 'VTab', 'props': {'value': 'pansou_tab'}, 'text': '盘搜'},
                             {'component': 'VTab', 'props': {'value': 'dian115_tab'}, 'text': '癫影'},
-                            {'component': 'VTab', 'props': {'value': 'hdhive_tab'}, 'text': '影巢'},
                             {'component': 'VTab', 'props': {'value': 'kdocs_tab'}, 'text': '金山文档'}
                         ]
                     },
@@ -884,7 +834,6 @@ class UIConfig:
                             UIConfig._tab_item('checkin_tab', checkin_tab),
                             UIConfig._tab_item('pansou_tab', pansou_tab),
                             UIConfig._tab_item('dian115_tab', dian115_tab),
-                            UIConfig._tab_item('hdhive_tab', hdhive_tab),
                             UIConfig._tab_item('kdocs_tab', kdocs_tab)
                         ]
                     }
@@ -955,27 +904,9 @@ class UIConfig:
             "dian115_max_unlock_points": 50,
             "dian115_max_points_per_sub": 20,
 
-            # 影巢 HDHive（站点已失效，仅作兼容保留）
             "nullbr_enabled": False,
             "nullbr_appid": "",
             "nullbr_api_key": "",
-            "hdhive_enabled": False,
-            "hdhive_query_mode": "api",
-            "hdhive_api_key": "",
-            "hdhive_client_id": "",
-            "hdhive_redirect_uri": "",
-            "hdhive_auth_code": "",
-            "hdhive_access_token": "",
-            "hdhive_refresh_token": "",
-            "hdhive_token_expires_at": 0,
-            "hdhive_auto_unlock": False,
-            "hdhive_max_unlock_points": 50,
-            "hdhive_max_points_per_sub": 20,
-            "hdhive_username": "",
-            "hdhive_password": "",
-            "hdhive_cookie": "",
-            "hdhive_auto_refresh": True,
-            "hdhive_refresh_before": 86400,
 
             # 金山文档 KDocs
             "kdocs_enabled": False,

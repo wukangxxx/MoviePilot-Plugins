@@ -240,13 +240,15 @@ class P115ClientManager:
         """检查登录状态"""
         return bool(self.get_account_info().get("connected"))
 
-    def get_account_info(self) -> Dict[str, Any]:
+    def get_account_info(self, silent: bool = False) -> Dict[str, Any]:
         """
         读取 115 网盘账户信息（v1.8.2 新增，供配置页状态卡片展示）。
 
         复用 user_my_info 接口，不额外增加请求；任何异常均降级为未连接，
         不影响插件主流程。
 
+        :param silent: True 时只写 debug 日志（后台定时刷新用，避免每轮
+            往插件日志里刷「115 登录成功」）。
         :return: {"connected": bool, "name": str, "vip": bool, ...}
         """
         if not self.client:
@@ -257,7 +259,10 @@ class P115ClientManager:
             self._api_call_count += 1
             user_info = self.client.user_my_info()
         except Exception as e:
-            logger.error(f"检查 115 登录状态失败: {e}")
+            if silent:
+                logger.debug(f"检查 115 登录状态失败: {e}")
+            else:
+                logger.error(f"检查 115 登录状态失败: {e}")
             return {"connected": False, "error": f"读取失败：{e}"}
 
         if not isinstance(user_info, dict) or not user_info.get("state"):
@@ -266,7 +271,10 @@ class P115ClientManager:
 
         data = user_info.get("data") or {}
         uname = str(data.get("uname") or data.get("user_name") or "115 用户")
-        logger.info(f"115 登录成功: {uname}")
+        if silent:
+            logger.debug(f"115 登录成功: {uname}")
+        else:
+            logger.info(f"115 登录成功: {uname}")
         return {
             "connected": True,
             "name": uname,
@@ -660,6 +668,56 @@ class P115ClientManager:
                     return False
 
         # 目录名没有明显的季数标识，不跳过（可能包含多季或其他内容）
+        return False
+
+    def add_offline_task(self, url: str, save_path: str = "") -> bool:
+        """把磁力 / 电驴等离线链接交给 115 云下载（离线下载）保存。
+
+        癫影有大量 ``share_kind=offline`` 的资源：解锁后只给 magnet / ed2k，
+        **没有 115 分享码**，走不了分享转存（v1.8.4 及以前因此白扣积分）。
+        这类链接必须改走云下载，由 115 自己把文件拉进网盘。
+
+        :param url: magnet:?xt=... / ed2k://... 等
+        :param save_path: 网盘内的目标目录（会自动解析为 cid）
+        :return: 任务是否添加成功
+        """
+        if not self.client:
+            logger.error("115 客户端未初始化，无法添加离线下载任务")
+            return False
+
+        link = str(url or "").strip()
+        if not link:
+            return False
+
+        cid = 0
+        if save_path:
+            try:
+                resolved = self.get_pid_by_path(save_path)
+                cid = resolved if isinstance(resolved, int) and resolved > 0 else 0
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"解析离线下载保存目录失败（{save_path}）：{e}")
+                cid = 0
+
+        try:
+            self.rate_limiter.wait()
+            self._api_call_count += 1
+            resp = self.client.clouddownload_task_add_url(
+                {"url": link, "wp_path_id": cid}
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"添加 115 离线下载任务失败: {e}")
+            return False
+
+        if isinstance(resp, dict) and resp.get("state"):
+            logger.info(f"115 云下载任务已添加（cid={cid}）：{link[:80]}")
+            return True
+
+        message = ""
+        if isinstance(resp, dict):
+            message = str(
+                resp.get("error_msg") or resp.get("error") or resp.get("errcode") or ""
+            )
+        logger.error(f"115 云下载任务添加失败：{message or resp}")
         return False
 
     def transfer_share(self, share_url: str, save_path: str) -> bool:

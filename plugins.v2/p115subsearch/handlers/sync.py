@@ -3,7 +3,7 @@
 负责核心的同步逻辑：处理电影订阅、处理电视剧订阅
 """
 import datetime
-from typing import List, Dict, Any, Set, Optional, Callable
+from typing import List, Dict, Any, Set, Optional, Callable, Tuple
 
 from app.core.config import global_vars
 from app.core.metainfo import MetaInfo
@@ -19,6 +19,16 @@ from app.utils.string import StringUtils
 from ..utils import FileMatcher, SubscribeFilter
 from .search import SearchHandler
 from .subscribe import SubscribeHandler
+
+
+# 离线型链接前缀：这些链接没有 115 分享码，只能走 115 云下载（离线下载）
+OFFLINE_LINK_PREFIXES = ("magnet:", "ed2k://", "thunder://", "ftp://")
+
+
+def _is_offline_link(url: str) -> bool:
+    """是否为磁力 / 电驴等离线型链接（癫影 share_kind=offline 资源）。"""
+    text = str(url or "").strip().lower()
+    return any(text.startswith(prefix) for prefix in OFFLINE_LINK_PREFIXES)
 
 
 class SyncHandler:
@@ -127,7 +137,7 @@ class SyncHandler:
 
     def _pansou_check_single(self, share_url: str, pwd: str = "") -> str:
         """
-        对单个链接补做 PanSou 有效性检测（用于批量检测未覆盖的链接，如 HDHive 解锁后的链接）
+        对单个链接补做 PanSou 有效性检测（用于批量检测未覆盖的链接）
 
         :param share_url: 分享链接
         :param pwd: 提取码（可为空）
@@ -147,9 +157,7 @@ class SyncHandler:
         """
         统一处理「延迟解锁」资源（v1.8.0）
 
-        两类来源共用同一条按需扣分链路：
-          * HDHive：资源带 slug
-          * Dian115：资源带 share_id / resource_ref
+        按需扣分解锁链路（Dian115 资源带 share_id / resource_ref）
 
         :param resource: 搜索结果条目（need_unlock=True）
         :param resource_title: 资源标题（仅用于日志）
@@ -158,12 +166,11 @@ class SyncHandler:
         if not isinstance(resource, dict):
             return ""
         owner = str(resource.get("_source") or "")
-        slug = str(resource.get("slug") or "")
         share_id = int(resource.get("share_id") or resource.get("resource_ref") or 0)
         unlock_points = int(resource.get("unlock_points") or 0)
 
         # 优先判定业务归属：显式 _source 优先，其次按字段特征推断
-        is_dian115 = owner == "dian115" or (owner == "" and not slug and share_id > 0)
+        is_dian115 = owner == "dian115" or (owner == "" and share_id > 0)
         if is_dian115:
             if share_id <= 0:
                 logger.error(f"Dian115 待解锁资源缺少分享 ID，跳过: {resource_title}")
@@ -178,16 +185,94 @@ class SyncHandler:
                 return ""
             return unlocked_url
 
-        if slug:
-            logger.info(f"遇到需要解锁的 HDHive 收费资源 {resource_title} (slug: {slug})，尝试消耗积分解锁...")
-            unlocked_url = self._search_handler.unlock_hdhive_resource(slug, unlock_points)
-            if not unlocked_url:
-                logger.error(f"未能解锁 HDHive 收费资源: {resource_title}")
-                return ""
-            return unlocked_url
-
-        logger.error(f"待解锁资源既无 slug 也无 share_id，无法处理: {resource_title}")
+        logger.error(f"待解锁资源缺少 share_id，无法处理: {resource_title}")
         return ""
+
+    def _submit_offline_link(
+            self,
+            share_url: str,
+            save_dir: str,
+            mediainfo,
+            media_type: str,
+            resource_title: str,
+            subscribe_filter,
+            subscribe,
+            history: List[dict],
+            transfer_details: List[Dict[str, Any]],
+    ) -> Tuple[bool, Dict[str, Any]]:
+        """癫影离线型资源（magnet / ed2k）：改走 115 云下载。
+
+        这类资源（``share_kind=offline``）**没有 115 分享码**，分享转存必然
+        失败——v1.8.4 及以前因此白扣积分。v1.8.5 起交给 115 自己离线拉取。
+
+        云下载是异步的：任务提交成功只代表 115 已接单，文件要等下载完成才
+        出现在网盘里，因此**不在此处完结订阅**，避免订阅被提前消掉。
+
+        :return: (是否提交成功, 历史记录条目)
+        """
+        file_name = str(resource_title or "").strip()
+        current_score, is_perfect = 0, True
+        if subscribe_filter is not None and subscribe_filter.has_filters():
+            _, current_score = subscribe_filter.match(file_name)
+            is_perfect = subscribe_filter.is_perfect_match(file_name)
+
+        scheme = str(share_url or "").split(":", 1)[0] or "离线"
+        logger.info(
+            f"识别为离线型链接（{scheme}），改用 115 云下载：{file_name} -> {save_dir}"
+        )
+        success = bool(
+            self._p115_manager
+            and self._p115_manager.add_offline_task(share_url, save_dir)
+        )
+
+        history_item = {
+            "title": mediainfo.title,
+            "year": mediainfo.year,
+            "type": media_type,
+            "status": "成功" if success else "失败",
+            "share_url": share_url,
+            "file_name": file_name,
+            "filter_score": current_score,
+            "perfect_match": is_perfect,
+            "time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        history.append(history_item)
+
+        if not success:
+            logger.error(f"115 云下载任务提交失败：{file_name}")
+            return False, history_item
+
+        logger.info(f"已提交 115 云下载任务：{mediainfo.title}")
+        transfer_details.append({
+            "type": media_type,
+            "title": mediainfo.title,
+            "year": mediainfo.year,
+            "image": mediainfo.get_poster_image(),
+            "file_name": file_name,
+        })
+        try:
+            DownloadHistoryOper().add(
+                path=save_dir,
+                type=mediainfo.type.value,
+                title=mediainfo.title,
+                year=mediainfo.year,
+                tmdbid=mediainfo.tmdb_id,
+                imdbid=mediainfo.imdb_id,
+                tvdbid=mediainfo.tvdb_id,
+                doubanid=mediainfo.douban_id,
+                image=mediainfo.get_poster_image(),
+                downloader="115网盘",
+                download_hash="",
+                torrent_name=resource_title,
+                torrent_description=file_name,
+                torrent_site="115云下载",
+                username="P115SubSearch",
+                date=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                note={"source": f"Subscribe|{subscribe.name}", "share_url": share_url},
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"记录云下载历史失败：{e}")
+        return True, history_item
 
     def process_movie_subscribe(
         self,
@@ -322,7 +407,7 @@ class SyncHandler:
                     if _pwd and share_url and "password=" not in share_url:
                         share_url = f"{share_url}?password={_pwd}"
 
-                    # 检查是否是刚搜索出尚未真正解锁的延期解锁资源（HDHive / Dian115）
+                    # 检查是否是刚搜索出尚未真正解锁的延期解锁资源（Dian115）
                     if resource.get("need_unlock") and not share_url:
                         unlocked_url = self._unlock_pending_resource(resource, resource_title)
                         if not unlocked_url:
@@ -341,10 +426,35 @@ class SyncHandler:
                     if pansou_check_map is not None:
                         pansou_state = pansou_check_map.get(share_url, "")
                         if not pansou_state:
-                            # 批量检测未覆盖的链接（如 HDHive 解锁后才得到），单独补检
+                            # 批量检测未覆盖的链接，单独补检
                             pansou_state = self._pansou_check_single(share_url, _pwd)
                     if pansou_state == "bad":
                         logger.warning(f"PanSou 检测判定链接已失效，跳过: {share_url}")
+                        continue
+
+                    # 癫影离线型资源（magnet / ed2k）：没有 115 分享码，改走云下载
+                    if _is_offline_link(share_url):
+                        movie_dir = (
+                            f"{self._movie_save_path}/{mediainfo.title} ({mediainfo.year})"
+                            if mediainfo.year
+                            else f"{self._movie_save_path}/{mediainfo.title}"
+                        )
+                        offline_ok, offline_item = self._submit_offline_link(
+                            share_url=share_url,
+                            save_dir=movie_dir,
+                            mediainfo=mediainfo,
+                            media_type="电影",
+                            resource_title=resource_title,
+                            subscribe_filter=subscribe_filter,
+                            subscribe=subscribe,
+                            history=history,
+                            transfer_details=transfer_details,
+                        )
+                        if offline_ok:
+                            transferred_count += 1
+                            movie_transfer_success_count += 1
+                            channel_transfer_success += 1
+                            movie_history_score = offline_item.get("filter_score") or 0
                         continue
 
                     logger.info(f"检查分享：{resource_title} - {share_url}")
@@ -457,8 +567,6 @@ class SyncHandler:
                                     success_episodes=[1]
                                 )
                                 # 订阅完成，清除该订阅的历史积分记录
-                                if hasattr(self._search_handler, 'clear_sub_points'):
-                                    self._search_handler.clear_sub_points(sub_key)
                                 if hasattr(self._search_handler, 'clear_dian115_sub_points'):
                                     self._search_handler.clear_dian115_sub_points(sub_key)
                             else:
@@ -572,8 +680,6 @@ class SyncHandler:
                 elif subscribe.lack_episode != 0:
                     SubscribeOper().update(subscribe.id, {"lack_episode": 0})
                 # 订阅已完整，清除历史积分记录
-                if hasattr(self._search_handler, 'clear_sub_points'):
-                    self._search_handler.clear_sub_points(sub_key)
                 if hasattr(self._search_handler, 'clear_dian115_sub_points'):
                     self._search_handler.clear_dian115_sub_points(sub_key)
                 return transferred_count
@@ -669,8 +775,6 @@ class SyncHandler:
                         success_episodes=list(existing_episodes_in_cloud)
                     )
                     # 缺失集数已全部补齐，清除历史积分记录
-                    if hasattr(self._search_handler, 'clear_sub_points'):
-                        self._search_handler.clear_sub_points(sub_key)
                     if hasattr(self._search_handler, 'clear_dian115_sub_points'):
                         self._search_handler.clear_dian115_sub_points(sub_key)
                 return transferred_count
@@ -788,7 +892,7 @@ class SyncHandler:
                     if _pwd and share_url and "password=" not in share_url:
                         share_url = f"{share_url}?password={_pwd}"
 
-                    # 检查是否是刚搜索出尚未真正解锁的延期解锁资源（HDHive / Dian115）
+                    # 检查是否是刚搜索出尚未真正解锁的延期解锁资源（Dian115）
                     if resource.get("need_unlock") and not share_url:
                         unlocked_url = self._unlock_pending_resource(resource, resource_title)
                         if not unlocked_url:
@@ -807,10 +911,29 @@ class SyncHandler:
                     if pansou_check_map is not None:
                         pansou_state = pansou_check_map.get(share_url, "")
                         if not pansou_state:
-                            # 批量检测未覆盖的链接（如 HDHive 解锁后才得到），单独补检
+                            # 批量检测未覆盖的链接，单独补检
                             pansou_state = self._pansou_check_single(share_url, _pwd)
                     if pansou_state == "bad":
                         logger.warning(f"PanSou 检测判定链接已失效，跳过: {share_url}")
+                        continue
+
+                    # 癫影离线型资源（magnet / ed2k）：没有 115 分享码，改走云下载
+                    if _is_offline_link(share_url):
+                        season_dir = f"{self._save_path}/{show_folder}/Season {season}"
+                        offline_ok, _ = self._submit_offline_link(
+                            share_url=share_url,
+                            save_dir=season_dir,
+                            mediainfo=mediainfo,
+                            media_type="电视剧",
+                            resource_title=resource_title,
+                            subscribe_filter=subscribe_filter,
+                            subscribe=subscribe,
+                            history=history,
+                            transfer_details=transfer_details,
+                        )
+                        if offline_ok:
+                            transferred_count += 1
+                            channel_transfer_success += 1
                         continue
 
                     logger.info(f"检查分享：{resource_title} - {share_url}")
@@ -1022,8 +1145,6 @@ class SyncHandler:
                     expected = set(range(start_ep, total_ep + 1))
                     downloaded = set(subscribe.note or []).union(set(all_success_episodes))
                     if not (expected - downloaded):
-                        if hasattr(self._search_handler, 'clear_sub_points'):
-                            self._search_handler.clear_sub_points(sub_key)
                         if hasattr(self._search_handler, 'clear_dian115_sub_points'):
                             self._search_handler.clear_dian115_sub_points(sub_key)
 

@@ -95,8 +95,6 @@ sys.modules['p115subsearch'].__path__ = [str(PLUGIN)]
 sys.modules['p115subsearch.clients'].PanSouClient = object
 sys.modules['p115subsearch.clients'].P115ClientManager = object
 sys.modules['p115subsearch.clients'].NullbrClient = object
-sys.modules['p115subsearch.clients'].HDHiveOpenAPIClient = object
-sys.modules['p115subsearch.clients'].HDHiveOpenAPIError = Exception
 sys.modules['p115subsearch.clients'].KDocsClient = object
 sys.modules['p115subsearch.clients'].KDocsError = Exception
 sys.modules['p115subsearch.clients'].Dian115Client = object
@@ -109,7 +107,6 @@ sys.modules['p115subsearch.handlers'].SubscribeHandler = lambda **k: types.Simpl
 sys.modules['p115subsearch.handlers'].ApiHandler = lambda **k: types.SimpleNamespace()
 sys.modules['p115subsearch.handlers'].CheckinHandler = lambda **k: types.SimpleNamespace()
 sys.modules['p115subsearch.ui'].UIConfig = types.SimpleNamespace(get_form=lambda: ([], {}), get_page=lambda h: [])
-sys.modules['p115subsearch.utils'].download_so_file = lambda *a, **k: None
 
 # 外部依赖桩（__init__.py 顶部 import）
 for mod in ('pytz', 'apscheduler.schedulers.background', 'apscheduler.triggers.cron', 'sqlalchemy'):

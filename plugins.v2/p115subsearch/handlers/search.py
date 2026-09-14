@@ -1,10 +1,10 @@
 """
 搜索处理模块
-负责所有搜索相关逻辑：Dian115、PanSou、KDocs、HDHive
+负责所有搜索相关逻辑：Dian115、PanSou、KDocs
 
 v1.8.0 起：
     * 新增 Dian115（癫影）搜索源，仅返回 115 分享链接；
-    * Nullbr / HDHive 站点已失效，从可用搜索源中剔除（配置项保留但不再参与调度）。
+    * Nullbr 站点已失效，从可用搜索源中剔除（配置项保留但不再参与调度）。
 """
 from typing import Optional, List, Dict, Any
 
@@ -14,6 +14,7 @@ from app.schemas import MediaInfo
 from app.schemas.types import MediaType
 
 from ..utils import convert_nullbr_to_pansou_format, SimpleTTLCache
+from ..clients.dian115 import is_115_share_url
 
 
 class SearchHandler:
@@ -23,17 +24,8 @@ class SearchHandler:
         self,
         pansou_client,
         nullbr_client,
-        hdhive_client,
         pansou_enabled: bool = False,
         nullbr_enabled: bool = False,
-        hdhive_enabled: bool = False,
-        hdhive_username: str = "",
-        hdhive_password: str = "",
-        hdhive_cookie: str = "",
-        hdhive_query_mode: str = "api",
-        hdhive_auto_unlock: bool = False,
-        hdhive_max_unlock_points: int = 50,
-        hdhive_max_points_per_sub: int = 20,
         only_115: bool = True,
         pansou_channels: str = "",
         search_source_order: Optional[List[str]] = None,
@@ -50,19 +42,12 @@ class SearchHandler:
 
         :param pansou_client: PanSou 客户端实例
         :param nullbr_client: Nullbr 客户端实例（站点已失效，不再参与调度）
-        :param hdhive_client: HDHive OpenAPI 客户端实例（API 模式使用，站点已失效）
         :param pansou_enabled: 是否启用 PanSou
         :param nullbr_enabled: 是否启用 Nullbr（已失效，保留兼容）
-        :param hdhive_enabled: 是否启用 HDHive（已失效，保留兼容）
-        :param hdhive_username: HDHive 用户名
-        :param hdhive_password: HDHive 密码
-        :param hdhive_cookie: HDHive Cookie
-        :param hdhive_query_mode: HDHive 查询模式
-        :param hdhive_auto_unlock: 是否自动解锁 HDHive 资源
         :param only_115: 是否只搜索115网盘资源
         :param pansou_channels: PanSou 搜索频道
-        :param search_source_order: 自定义搜索源优先级列表，如 ["pansou", "hdhive"]；
-                                    为空时使用默认优先级 Nullbr > HDHive > PanSou
+        :param search_source_order: 自定义搜索源优先级列表，如 ["pansou", "dian115"]；
+                                    为空时使用默认优先级 Dian115 > PanSou > KDocs
         :param kdocs_client: KDocs 在线文档库客户端实例
         :param kdocs_enabled: 是否启用 KDocs 在线文档库
         :param dian115_client: Dian115（癫影）客户端实例
@@ -73,19 +58,8 @@ class SearchHandler:
         """
         self._pansou_client = pansou_client
         self._nullbr_client = nullbr_client
-        self._hdhive_client = hdhive_client
         self._pansou_enabled = pansou_enabled
         self._nullbr_enabled = nullbr_enabled
-        self._hdhive_enabled = hdhive_enabled
-        self._hdhive_username = hdhive_username
-        self._hdhive_password = hdhive_password
-        self._hdhive_cookie = hdhive_cookie
-        self._hdhive_query_mode = hdhive_query_mode
-        self._hdhive_auto_unlock = hdhive_auto_unlock
-        self._hdhive_max_unlock_points = hdhive_max_unlock_points
-        self._hdhive_max_points_per_sub = hdhive_max_points_per_sub
-        self._current_spent_points = 0
-        self._sub_spent_points = 0
         self._current_sub_key = ""
         self._get_data_func = None
         self._save_data_func = None
@@ -99,7 +73,7 @@ class SearchHandler:
         self._dian115_auto_unlock = dian115_auto_unlock
         self._dian115_max_unlock_points = dian115_max_unlock_points
         self._dian115_max_points_per_sub = dian115_max_points_per_sub
-        # Dian115 的积分账本与 HDHive 相互独立，避免两个渠道互相挤占预算
+        # Dian115 的积分账本独立维护，避免跨渠道互相挤占预算
         self._dian115_spent_points = 0
         self._dian115_sub_spent_points = 0
         # 已解锁链接幂等缓存：同一分享在同一 TTL 内只扣一次分
@@ -115,7 +89,7 @@ class SearchHandler:
            未出现在自定义列表中的已启用源按默认顺序追加在末尾
         2. 未配置时使用默认优先级 Dian115 > PanSou > KDocs
 
-        v1.8.0：Nullbr 与 HDHive 站点已停止服务，**硬屏蔽**（即使配置里仍勾选
+        v1.8.0：Nullbr 站点已停止服务，**硬屏蔽**（即使配置里仍勾选
         也不参与调度，避免订阅流程白白等待超时）。其配置项保留仅作兼容。
 
         :return: 搜索源名称列表
@@ -126,10 +100,6 @@ class SearchHandler:
         # Nullbr —— 站点已失效，永久剔除
         # if self._nullbr_enabled and self._nullbr_client:
         #     available.append("nullbr")
-
-        # HDHive —— 站点已失效，永久剔除
-        # if self._hdhive_enabled:
-        #     available.append("hdhive")
 
         # Dian115（癫影）
         if self._dian115_enabled and self._dian115_client:
@@ -275,7 +245,7 @@ class SearchHandler:
             logger.info("Dian115 未找到资源")
             return []
 
-        # 两级预算过滤（与 HDHive 同一套语义）：
+        # 两级预算过滤：
         #   * 单条解锁成本高于任一预算上限的，直接丢弃（无论如何都解锁不了）
         #   * 免费 / 已解锁条目直接采用
         #   * 收费条目：开启自动解锁时标记为待解锁，交给 SyncHandler 按需真正扣分
@@ -311,7 +281,7 @@ class SearchHandler:
         """
         供 SyncHandler 调用的 Dian115 手动解锁（扣积分）API
 
-        与 HDHive 一致采用两级预算：单次任务总预算 + 单订阅预算；
+        采用两级预算：单次任务总预算 + 单订阅预算；
         服务端实际扣分与预估不一致时以服务端为准入账。
 
         :param share_id: Dian115 分享 ID（资源条目的 resource_ref）
@@ -384,13 +354,24 @@ class SearchHandler:
 
     @staticmethod
     def _dian115_extract_unlock_url(payload: Dict) -> str:
-        """从解锁响应中取出 115 分享链接（响应结构随版本变化，做多重兼容）。"""
+        """从解锁响应中取链接：优先 115 分享链接，其次离线链接（magnet/ed2k）。
+
+        癫影存在 ``share_kind=offline`` 的资源，解锁后**只给 magnet / ed2k**，
+        旧实现无条件取第一个非空字段，会把 magnet 当成 115 分享链接返回，
+        上层解析 share_code 必然失败（还白扣积分）。现在两轮取值：
+        先找真正的 115 分享链接，找不到才回退离线链接（由上层走云下载）。
+        """
         if not isinstance(payload, dict):
             return ""
         data = payload.get("payload")
         if not isinstance(data, dict):
             data = payload
-        for key in ("url", "share_url", "full_url", "link"):
+        keys = ("url", "share_url", "full_url", "link", "share_link")
+        for key in keys:
+            value = str(data.get(key) or "").strip()
+            if value and is_115_share_url(value):
+                return value
+        for key in keys:
             value = str(data.get(key) or "").strip()
             if value:
                 return value
@@ -549,222 +530,6 @@ class SearchHandler:
         logger.info(f"PanSou 未找到资源")
         return []
 
-    def _search_hdhive(
-        self,
-        mediainfo: MediaInfo,
-        media_type: MediaType,
-        season: Optional[int] = None
-    ) -> List[Dict]:
-        """
-        使用 HDHive 搜索资源
-        根据配置的查询模式选择:
-        - playwright: 使用 Playwright 浏览器模拟获取分享链接
-        - api: 使用 Cookie 直接请求 API
-
-        :param mediainfo: 媒体信息
-        :param media_type: 媒体类型（MOVIE 或 TV）
-        :param season: 季号（电视剧时使用）
-        :return: 115网盘资源列表（统一格式）
-        """
-        from ..lib.hdhive import MediaType as HDHiveMediaType
-        if not mediainfo.tmdb_id:
-            logger.warning(f"{mediainfo.title} 缺少 TMDB ID，无法使用 HDHive 查询")
-            return []
-
-        hdhive_media_type = "movie" if media_type == MediaType.MOVIE else "tv"
-
-        if self._hdhive_query_mode == "playwright":
-            return self._search_hdhive_playwright(mediainfo, HDHiveMediaType.MOVIE if media_type == MediaType.MOVIE else HDHiveMediaType.TV)
-        else:
-            return self._search_hdhive_api(mediainfo, hdhive_media_type)
-
-    def _search_hdhive_playwright(self, mediainfo: MediaInfo, hdhive_media_type) -> List[Dict]:
-        """
-        使用 Playwright 浏览器模拟模式查询 HDHive 资源
-        需要用户名和密码进行登录
-        """
-        if not self._hdhive_username or not self._hdhive_password:
-            logger.warning("HDHive Playwright 模式需要配置用户名和密码")
-            return []
-
-        try:
-            import asyncio
-            from ..lib.hdhive import create_async_client as create_hdhive_async_client
-
-            proxy = settings.PROXY
-
-            logger.info(f"使用 HDHive (Playwright) 查询: {mediainfo.title} (TMDB ID: {mediainfo.tmdb_id})，代理：{proxy}")
-
-            async def async_search():
-                async with create_hdhive_async_client(
-                    username=self._hdhive_username,
-                    password=self._hdhive_password,
-                    cookie=self._hdhive_cookie,
-                    browser_type="chromium",
-                    headless=True,
-                    proxy=proxy,
-                    state_file=f"hdhive_{self._hdhive_username}_state.json"
-                ) as client:
-                    # 获取媒体信息
-                    media = await client.get_media_by_tmdb_id(mediainfo.tmdb_id, hdhive_media_type)
-                    if not media:
-                        return []
-
-                    # 获取资源列表
-                    resources_result = await client.get_resources(media.slug, hdhive_media_type, media_id=media.id)
-                    if not resources_result or not resources_result.success:
-                        return []
-
-                    # 过滤免费的 115 资源并获取分享链接
-                    free_115_resources = []
-                    for res in resources_result.resources:
-                        if hasattr(res, 'website') and res.website.value == '115' and res.is_free:
-                            share_result = await client.get_share_url_by_click(res.slug)
-                            if share_result and share_result.url:
-                                free_115_resources.append({
-                                    "url": share_result.url,
-                                    "title": res.title,
-                                    "update_time": ""
-                                })
-
-                    return free_115_resources
-
-            # 运行异步任务
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                results = loop.run_until_complete(async_search())
-            finally:
-                loop.close()
-
-            if results:
-                logger.info(f"HDHive (Playwright) 找到 {len(results)} 个免费 115 资源")
-            else:
-                logger.info(f"HDHive (Playwright) 未找到免费 115 资源")
-            return results
-
-        except Exception as e:
-            logger.error(f"HDHive (Playwright) 查询失败: {e}")
-            return []
-
-    def _search_hdhive_api(self, mediainfo: MediaInfo, hdhive_media_type: str) -> List[Dict]:
-        """
-        使用 API 模式查询 HDHive 资源
-        需要应用 Secret + 用户授权（OpenAPI 客户端）
-        """
-        from ..clients import HDHiveOpenAPIError
-
-        if not self._hdhive_client or not self._hdhive_client.is_ready:
-            logger.warning("HDHive API 模式需要配置应用 Secret 并完成用户授权")
-            return []
-
-        try:
-            logger.info(f"使用 HDHive (API) 查询: {mediainfo.title} (TMDB ID: {mediainfo.tmdb_id})")
-
-            # 1. 获取资源列表
-            try:
-                data = self._hdhive_client.query_resources(hdhive_media_type, mediainfo.tmdb_id)
-            except HDHiveOpenAPIError as e:
-                logger.error(f"HDHive (API) 获取资源失败: [{e.code}] {e.message} {e.description}")
-                return []
-
-            if not data.get("success") or not data.get("data"):
-                logger.info(f"HDHive (API) 未找到资源: {mediainfo.title}, 返回数据: {data}")
-                return []
-
-            resources = data.get("data", [])
-            
-            free_115_resources = []
-            resources = [ resource for resource in resources if resource.get("pan_type") == "115" ]
-            logger.info(f"HDHive (API) 找到 {len(resources)} 个115网盘资源，开始过滤...")
-            for resource in resources:
-                # 过滤出可能是115网盘的且免费的资源 (0或者null)，或者如果开启了自动解锁，则都可以尝试
-                
-                # # 1. 前置过滤：根据 website 属性判断是否是 115 网盘
-                # website = resource.get("website")
-                # if isinstance(website, dict):
-                #     website_value = str(website.get("value", ""))
-                #     if website_value and website_value != "115":
-                #         logger.info(f"HDHive (API) 资源 {resource.get('title')} 的 website_value 不是 115 ({website_value})，跳过")
-                #         continue
-                # elif isinstance(website, str):
-                #     if website and website != "115":
-                #         logger.info(f"HDHive (API) 资源 {resource.get('title')} 的 website 不是 115 ({website})，跳过")
-                #         continue
-                
-                # 2. 免费策略/积分判断
-                unlock_points = resource.get("unlock_points")
-                is_free = unlock_points is None or unlock_points == 0 or resource.get("is_unlocked")
-                
-                logger.info(f"HDHive (API) 处理资源: title='{resource.get('title')}', slug='{resource.get('slug')}', unlock_points={unlock_points}, is_unlocked={resource.get('is_unlocked')}, is_free={is_free}")
-
-                # 单个资源积分超出单订阅预算上限的，搜索阶段直接过滤掉（这些无论如何都解锁不了）
-                if not is_free and unlock_points is not None:
-                    if unlock_points > self._hdhive_max_points_per_sub:
-                        logger.info(f"HDHive (API) 资源 {resource.get('title')} 单次解锁积分 ({unlock_points}) 超出单订阅预算上限 ({self._hdhive_max_points_per_sub})，跳过")
-                        continue
-                    if unlock_points > self._hdhive_max_unlock_points:
-                        logger.info(f"HDHive (API) 资源 {resource.get('title')} 单次解锁积分 ({unlock_points}) 超出全局预算上限 ({self._hdhive_max_unlock_points})，跳过")
-                        continue
-
-                if is_free or self._hdhive_auto_unlock:
-                    slug = resource.get("slug")
-                    if not slug:
-                        logger.info(f"HDHive (API) 资源缺少 slug，跳过: {resource}")
-                        continue
-
-                    # 如果免费，则直接解锁并获取链接
-                    if is_free:
-                        logger.info(f"HDHive (API) 尝试免费解锁资源: {slug}")
-                        try:
-                            unlock_data = self._hdhive_client.unlock_resource(slug)
-                        except HDHiveOpenAPIError as e:
-                            logger.error(f"HDHive (API) 解锁请求失败: [{e.code}] {e.message} {e.description}")
-                            continue
-
-                        if unlock_data.get("success") and unlock_data.get("data"):
-                            share_url = unlock_data["data"].get("full_url", "")
-                            logger.info(f"HDHive (API) 成功解锁免费资源, 分享链接: {share_url}")
-                            free_115_resources.append({
-                                "url": share_url,
-                                "title": resource.get("title", ""),
-                                "update_time": resource.get("created_at", ""),
-                                "is_official": bool(resource.get("is_official"))
-                            })
-                        else:
-                            logger.error(f"HDHive (API) 解锁失败，返回数据异常或非成功: {unlock_data}")
-                    else:
-                        # 对于非免费资源，延迟解锁：返回标记并携带 slug，后续供 SyncHandler 按需调用 unlock
-                        logger.info(f"HDHive (API) 收费资源将其加入列表延迟解锁: {slug}")
-                        free_115_resources.append({
-                            "url": "",  # 此时没有真正的链接
-                            "title": resource.get("title", ""),
-                            "update_time": resource.get("created_at", ""),
-                            "slug": slug,
-                            "need_unlock": True,
-                            "unlock_points": unlock_points,
-                            "is_official": bool(resource.get("is_official"))
-                        })
-                else:
-                    logger.info(f"HDHive (API) 资源 {resource.get('title')} 非免费且未开启自动解锁，已跳过")
-
-            if free_115_resources:
-                # 排序：免费优先，同组内官方(is_official)优先
-                free_115_resources.sort(key=lambda r: (
-                    r.get("need_unlock", False),      # False(免费) 排前面
-                    not r.get("is_official", False)    # True(官方) 排前面
-                ))
-                free_count = sum(1 for r in free_115_resources if not r.get("need_unlock"))
-                unlock_count = sum(1 for r in free_115_resources if r.get("need_unlock"))
-                logger.info(f"HDHive (API) 共得到 {len(free_115_resources)} 个 115 资源（免费: {free_count}, 待自费解锁: {unlock_count}）")
-                return free_115_resources
-            else:
-                logger.info(f"HDHive (API) 未找到可用 115 资源")
-                return []
-
-        except Exception as e:
-            logger.error(f"HDHive (API) 查询失败: {e}")
-            return []
 
     def _search_kdocs(
         self,
@@ -813,91 +578,15 @@ class SearchHandler:
     def reset_task_spent_points(self):
         """
         供 SyncHandler 在每次同步任务开始时调用
-        仅重置全局积分账本（单订阅的从持久化数据加载）
+        清空当前订阅标识（各渠道积分账本由各渠道自行维护）
         """
-        self._current_spent_points = 0
-        self._sub_spent_points = 0
         self._current_sub_key = ""
-        logger.info("HDHive (API) 任务全局积分账本已重置")
 
     def reset_sub_spent_points(self, sub_key: str = ""):
         """
         供 SyncHandler 在开始处理每一个新的订阅时调用
-        从持久化数据中加载该订阅的历史累计花费
+        记录当前订阅标识，供渠道积分账本持久化使用
         :param sub_key: 订阅唯一标识，如 "逐玉_S1"
         """
         self._current_sub_key = sub_key
-        if sub_key:
-            history = self._load_sub_points_history()
-            self._sub_spent_points = history.get(sub_key, 0)
-            if self._sub_spent_points > 0:
-                logger.info(f"HDHive (API) 订阅 {sub_key} 历史已花费 {self._sub_spent_points} 积分，剩余预算 {max(0, self._hdhive_max_points_per_sub - self._sub_spent_points)}")
-            else:
-                logger.info(f"HDHive (API) 订阅 {sub_key} 无历史积分花费")
-        else:
-            self._sub_spent_points = 0
 
-    def clear_sub_points(self, sub_key: str):
-        """
-        订阅完成后清除该订阅的历史积分记录
-        :param sub_key: 订阅唯一标识
-        """
-        history = self._load_sub_points_history()
-        if sub_key in history:
-            del history[sub_key]
-            self._save_sub_points_history(history)
-            logger.info(f"HDHive (API) 已清除订阅 {sub_key} 的历史积分记录")
-
-    def unlock_hdhive_resource(self, slug: str, unlock_points: int) -> Optional[str]:
-        """
-        供 SyncHandler 调用的手动解锁（扣积分）API
-        :param slug: 资源的标识符
-        :param unlock_points: 本次需消耗的积分
-        :return: 成功返回真实的 url，失败返回 None
-        """
-        from ..clients import HDHiveOpenAPIError
-
-        if not self._hdhive_client or not self._hdhive_client.is_ready:
-            logger.warning("HDHive API 模式需要配置应用 Secret 并完成用户授权才能解锁")
-            return None
-
-        # 双层检查积分预算
-        if (self._current_spent_points + unlock_points) > self._hdhive_max_unlock_points:
-            logger.warning(f"HDHive (API) 全局积分预算不足！全局已花费 {self._current_spent_points}，需 {unlock_points}，全局总预算 {self._hdhive_max_unlock_points}")
-            return None
-
-        if (self._sub_spent_points + unlock_points) > self._hdhive_max_points_per_sub:
-            logger.warning(f"HDHive (API) 单订阅积分预算不足！本订阅已花费 {self._sub_spent_points}，需 {unlock_points}，单订阅预算 {self._hdhive_max_points_per_sub}")
-            return None
-
-        try:
-            import time
-
-            logger.info(f"HDHive (API) 触发后备按需积分解锁资源: {slug}")
-            try:
-                unlock_data = self._hdhive_client.unlock_resource(slug)
-            except HDHiveOpenAPIError as e:
-                logger.error(f"HDHive (API) 解锁请求失败: [{e.code}] {e.message} {e.description}")
-                return None
-            finally:
-                # 为防风控拦截，解锁一个暂停 2 秒
-                time.sleep(2)
-
-            if unlock_data.get("success") and unlock_data.get("data"):
-                share_url = unlock_data["data"].get("full_url", "")
-                self._current_spent_points += unlock_points
-                self._sub_spent_points += unlock_points
-                # 持久化保存该订阅的累计花费
-                if self._current_sub_key:
-                    history = self._load_sub_points_history()
-                    history[self._current_sub_key] = self._sub_spent_points
-                    self._save_sub_points_history(history)
-                logger.info(f"HDHive (API) 成功扣除 {unlock_points} 积分解锁, 获得新分享链接: {share_url}。全局预算剩余: {self._hdhive_max_unlock_points - self._current_spent_points}, 当前订阅预算剩余: {self._hdhive_max_points_per_sub - self._sub_spent_points}")
-                return share_url
-            else:
-                logger.error(f"HDHive (API) 解锁失败，返回数据: {unlock_data}")
-
-        except Exception as e:
-            logger.error(f"HDHive (API) 解锁异常: {e}")
-
-        return None

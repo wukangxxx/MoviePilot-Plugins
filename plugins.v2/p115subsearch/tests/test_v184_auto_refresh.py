@@ -317,7 +317,7 @@ class FakeDian115:
 class FakeManager:
     client = object()
 
-    def get_account_info(self):
+    def get_account_info(self, silent=False):
         return {"connected": True, "name": "115用户", "vip": True,
                 "vip_name": "VIP", "expire": 100, "user_id": 1,
                 "space_used": 10, "space_total": 100}

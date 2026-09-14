@@ -5,7 +5,7 @@ P115SubSearch v1.8.0 自测（standalone，无 MoviePilot 运行时依赖）
 覆盖：
 A. 搜索源调度
    A1 dian115 在启用且有客户端时进入可用源
-   A2 Nullbr / HDHive 已失效，即使配置勾选也不进入可用源（硬屏蔽）
+   A2 Nullbr 已失效，即使配置勾选也不进入可用源（硬屏蔽）
    A3 自定义优先级生效，未列出的源追加在末尾
    A4 search_single_source("dian115") 走 _search_dian115
 B. Dian115 客户端资源归一化
@@ -178,11 +178,8 @@ def make_search_handler(**over):
     params = dict(
         pansou_client=object(),
         nullbr_client=object(),
-        hdhive_client=object(),
         pansou_enabled=True,
         nullbr_enabled=True,      # 即使勾选也应被硬屏蔽
-        hdhive_enabled=True,      # 即使勾选也应被硬屏蔽
-        hdhive_query_mode="api",
         kdocs_client=types.SimpleNamespace(is_ready=True),
         kdocs_enabled=True,
         dian115_client=over.pop("dian115_client", _FakeDianClient()),
@@ -199,7 +196,6 @@ h = make_search_handler()
 sources = h.get_enabled_sources()
 check("A1 dian115 进入可用源", "dian115" in sources, f"actual={sources}")
 check("A2-1 nullbr 被硬屏蔽", "nullbr" not in sources, f"actual={sources}")
-check("A2-2 hdhive 被硬屏蔽", "hdhive" not in sources, f"actual={sources}")
 check("A3 默认优先级 dian115 在前", sources[0] == "dian115", f"actual={sources}")
 
 h2 = make_search_handler(search_source_order=["kdocs", "pansou"])
@@ -408,13 +404,13 @@ check("C3-3 历史不超过上限 100",
 ui_src = SRC_UI
 tab_values = re.findall(r"'value': '(\w+_tab)'", ui_src)
 expected_tabs = ["subscribe_tab", "checkin_tab", "pansou_tab",
-                 "dian115_tab", "hdhive_tab", "kdocs_tab"]
+                 "dian115_tab", "kdocs_tab"]
 # VTabs 区域只应出现一次（VWindow 中复用同样字符串，去重后比对顺序）
 seen = []
 for v in tab_values:
     if v not in seen:
         seen.append(v)
-check("D1 六个 Tab 齐备且顺序正确", seen == expected_tabs, f"actual={seen}")
+check("D1 五个 Tab 齐备且顺序正确", seen == expected_tabs, f"actual={seen}")
 
 models = sorted(set(re.findall(r"'model': '([a-z0-9_]+)'", ui_src)))
 # 下划线开头的是 Tab 内部状态键（如 _tabs），不参与配置持久化
@@ -427,7 +423,6 @@ check("D3-1 主界面含基本功能配置区块", "插件基本功能配置" in
 check("D3-2 主界面含115网盘信息配置区块", "115网盘信息配置" in ui_src)
 check("D4 已失效 nullbr 表单项已移除",
       "'model': 'nullbr_enabled'" not in ui_src)
-check("D5 影巢标注失效提示", "已停止服务" in ui_src)
 
 # ================= 结果 =================
 

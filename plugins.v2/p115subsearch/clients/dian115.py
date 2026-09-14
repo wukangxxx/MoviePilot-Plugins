@@ -910,12 +910,23 @@ class Dian115Client:
 
     @staticmethod
     def _game_item(payload: Dict[str, Any], key: str) -> Dict[str, Any]:
-        games = payload.get("games") if isinstance(payload, dict) else None
-        container = games if isinstance(games, dict) else payload
-        item = container.get(key) if isinstance(container, dict) else None
-        if not isinstance(item, dict):
+        """取出指定娱乐项。
+
+        站点实测返回 ``{"code": "ok", "items": {"daily_wheel": {...}}}``，
+        历史上也曾是 ``games`` 或直接挂在根上；三种容器都要兼容，
+        否则会误报「缺少 daily_wheel 字段」导致签到/抽奖整条链路失败。
+        """
+        if not isinstance(payload, dict):
             raise Dian115Error(f"Dian115 娱乐状态缺少 {key} 字段", code="schema_changed")
-        return item
+        for container in (
+                payload.get("items"),
+                payload.get("games"),
+                payload.get("data"),
+                payload,
+        ):
+            if isinstance(container, dict) and isinstance(container.get(key), dict):
+                return container[key]
+        raise Dian115Error(f"Dian115 娱乐状态缺少 {key} 字段", code="schema_changed")
 
     def get_game_status(self) -> Dict[str, Any]:
         """读取每日转盘次数；签到链路禁止触发浏览器登录。"""
@@ -1057,7 +1068,7 @@ class Dian115Client:
     ) -> List[Dict[str, Any]]:
         """查询资源并转换为 P115SubSearch 统一格式（仅 115 分享链接）。
 
-        统一格式与 PanSou / Nullbr / HDHive 一致：
+        统一格式与 PanSou / Nullbr 一致：
             {"url": "...", "title": "...", "update_time": ""}
         """
         detail = self.resource_detail(tmdb_id, media_type, season)
@@ -1127,7 +1138,14 @@ class Dian115Client:
         """从任意层级的响应片中提取 115 分享链接（兼容多种字段命名）。"""
         if not isinstance(payload, dict):
             return ""
-        for key in ("url", "share_url", "full_url", "link", "share_link"):
+        keys = ("url", "share_url", "full_url", "link", "share_link")
+        # 先找真正的 115 分享链接；找不到再回退离线链接（magnet/ed2k），
+        # 由上层按链接类型决定转存方式（云下载）
+        for key in keys:
+            value = str(payload.get(key) or "").strip()
+            if value and is_115_share_url(value):
+                return value
+        for key in keys:
             value = str(payload.get(key) or "").strip()
             if value:
                 return value

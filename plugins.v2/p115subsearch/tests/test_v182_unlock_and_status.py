@@ -246,7 +246,7 @@ try:
                                 if isinstance(t, ast.Name):
                                     class_names.append(t.id)
     expected = ["basic_rows", "p115_rows", "subscribe_tab", "checkin_tab",
-                "pansou_tab", "dian115_tab", "hdhive_tab", "kdocs_tab",
+                "pansou_tab", "dian115_tab", "kdocs_tab",
                 "form_schema", "default_config"]
     missing_vars = [v for v in expected if v not in class_names]
     check("5-1 get_form 内所有 Tab 变量都在函数体顶层声明",

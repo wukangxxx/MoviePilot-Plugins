@@ -24,11 +24,10 @@ from app.log import logger
 from app.plugins import _PluginBase
 from app.schemas.types import EventType, MediaType, NotificationType
 
-from .clients import (PanSouClient, P115ClientManager, NullbrClient, HDHiveOpenAPIClient,
-                      HDHiveOpenAPIError, KDocsClient, KDocsError, Dian115Client, Dian115Error)
+from .clients import (PanSouClient, P115ClientManager, NullbrClient,
+                      KDocsClient, KDocsError, Dian115Client, Dian115Error)
 from .handlers import SearchHandler, SyncHandler, SubscribeHandler, ApiHandler, CheckinHandler
 from .ui import UIConfig
-from .utils import download_so_file
 
 lock = Lock()
 
@@ -137,7 +136,7 @@ class P115SubSearch(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/cloud.png"
     # 插件版本
-    plugin_version = "1.8.4"
+    plugin_version = "1.8.5"
     # 插件作者
     plugin_author = "mrtian2016"
     # 作者主页
@@ -176,19 +175,12 @@ class P115SubSearch(_PluginBase):
     _subscribe_filter_mode: str = "exclude"
     _exclude_subscribes: List[int] = []
     _include_subscribes: List[int] = []
-    # 搜索源优先级（按列表顺序），为空时默认 Nullbr > HDHive > PanSou
+    # 搜索源优先级（按列表顺序），为空时默认 Nullbr > PanSou
     _search_source_order: List[str] = []
 
     _nullbr_enabled: bool = False
     _nullbr_appid: str = ""
     _nullbr_api_key: str = ""
-
-    _hdhive_enabled: bool = False
-    _hdhive_username: str = ""
-    _hdhive_password: str = ""
-    _hdhive_cookie: str = ""
-    _hdhive_auto_refresh: bool = False
-    _hdhive_refresh_before: int = 86400
 
     # KDocs 在线文档库
     _kdocs_enabled: bool = False
@@ -197,19 +189,6 @@ class P115SubSearch(_PluginBase):
     _kdocs_cache_ttl_hours: int = 6
     _kdocs_batch_rows: int = 1000
     _kdocs_cookie: str = ""
-    _hdhive_query_mode: str = "api"
-    # OpenAPI 应用凭证：应用 Secret 放 X-API-Key（沿用 hdhive_api_key 配置键）
-    _hdhive_api_key: str = ""
-    _hdhive_client_id: str = ""
-    _hdhive_redirect_uri: str = ""
-    # OAuth 用户授权（授权码为一次性输入，换取 Token 后自动清空）
-    _hdhive_auth_code: str = ""
-    _hdhive_access_token: str = ""
-    _hdhive_refresh_token: str = ""
-    _hdhive_token_expires_at: float = 0
-    _hdhive_auto_unlock: bool = False
-    _hdhive_max_unlock_points: int = 50
-    _hdhive_max_points_per_sub: int = 20
 
     # 癫影（Dian115）—— 搜索源 + 签到/转盘（v1.8.0）
     _dian115_enabled: bool = False
@@ -227,7 +206,7 @@ class P115SubSearch(_PluginBase):
     _account_refresh_minutes: int = 30
     # 浏览器登录后复制的 __Host-portal_token（可选兜底；此前是唯一认证方式）
     _dian115_token: str = ""
-    # 积分解锁与预算（与 HDHive 同一套语义；默认关闭，不开就绝不扣分）
+    # 积分解锁与预算（默认关闭，不开就绝不扣分）
     _dian115_auto_unlock: bool = False
     _dian115_max_unlock_points: int = 50
     _dian115_max_points_per_sub: int = 20
@@ -263,7 +242,6 @@ class P115SubSearch(_PluginBase):
     _pansou_client: Optional[PanSouClient] = None
     _p115_manager: Optional[P115ClientManager] = None
     _nullbr_client: Optional[NullbrClient] = None
-    _hdhive_client: Optional[Any] = None
     _dian115_client: Optional[Any] = None
 
     # 处理器
@@ -797,7 +775,6 @@ class P115SubSearch(_PluginBase):
         self._migrate_legacy_config()
         self.stop_service()
         self._ensure_toggle_scheduler()
-        download_so_file(Path(__file__).parent / "lib")
 
         if config:
             self._enabled = config.get("enabled", False)
@@ -841,24 +818,6 @@ class P115SubSearch(_PluginBase):
             self._nullbr_enabled = config.get("nullbr_enabled", False)
             self._nullbr_appid = config.get("nullbr_appid", "")
             self._nullbr_api_key = config.get("nullbr_api_key", "")
-
-            self._hdhive_enabled = config.get("hdhive_enabled", False)
-            self._hdhive_query_mode = config.get("hdhive_query_mode", "api")
-            self._hdhive_api_key = (config.get("hdhive_api_key", "") or "").strip()
-            self._hdhive_client_id = (config.get("hdhive_client_id", "") or "").strip()
-            self._hdhive_redirect_uri = (config.get("hdhive_redirect_uri", "") or "").strip()
-            self._hdhive_auth_code = (config.get("hdhive_auth_code", "") or "").strip()
-            self._hdhive_access_token = config.get("hdhive_access_token", "")
-            self._hdhive_refresh_token = config.get("hdhive_refresh_token", "")
-            self._hdhive_token_expires_at = float(config.get("hdhive_token_expires_at", 0) or 0)
-            self._hdhive_auto_unlock = config.get("hdhive_auto_unlock", False)
-            self._hdhive_max_unlock_points = int(config.get("hdhive_max_unlock_points", 50) or 50)
-            self._hdhive_max_points_per_sub = int(config.get("hdhive_max_points_per_sub", 20) or 20)
-            self._hdhive_username = config.get("hdhive_username", "")
-            self._hdhive_password = config.get("hdhive_password", "")
-            self._hdhive_cookie = config.get("hdhive_cookie", "")
-            self._hdhive_auto_refresh = config.get("hdhive_auto_refresh", False)
-            self._hdhive_refresh_before = int(config.get("hdhive_refresh_before", 86400) or 86400)
 
             # KDocs 在线文档库配置
             self._kdocs_enabled = config.get("kdocs_enabled", False)
@@ -1029,16 +988,6 @@ class P115SubSearch(_PluginBase):
                 self._nullbr_client = NullbrClient(app_id=self._nullbr_appid, api_key=self._nullbr_api_key, proxy=proxy)
                 logger.info("Nullbr 客户端初始化成功")
 
-        # HDHive OpenAPI 客户端初始化（API 模式搜索/解锁共用；Playwright 模式搜索时动态创建浏览器客户端）
-        self._init_hdhive_openapi_client(proxy)
-        if self._hdhive_enabled:
-            if self._hdhive_query_mode == "playwright" and (not self._hdhive_username or not self._hdhive_password):
-                logger.warning("HDHive (Playwright 模式) 已启用但未配置用户名和密码，将无法使用 HDHive 查询功能")
-            elif self._hdhive_query_mode == "api" and (not self._hdhive_client or not self._hdhive_client.is_ready):
-                logger.warning("HDHive (API 模式) 已启用但未完成 OpenAPI 应用配置和用户授权，将无法使用 HDHive 查询功能")
-            else:
-                logger.info(f"HDHive 配置已加载（模式：{self._hdhive_query_mode}）")
-
         # KDocs 在线文档库客户端初始化
         self._kdocs_client = None
         if self._kdocs_enabled:
@@ -1146,70 +1095,6 @@ class P115SubSearch(_PluginBase):
                 "或粘贴 __Host-portal_token"
             )
 
-    # ------------------ HDHive OpenAPI ------------------
-
-    def _on_hdhive_token_update(self, tokens: Dict[str, Any]):
-        """Token 刷新后持久化到插件配置"""
-        self._hdhive_access_token = tokens.get("access_token", "")
-        self._hdhive_refresh_token = tokens.get("refresh_token", "")
-        self._hdhive_token_expires_at = float(tokens.get("token_expires_at", 0) or 0)
-        self.__update_config()
-
-    def _init_hdhive_openapi_client(self, proxy=None):
-        """
-        初始化 HDHive OpenAPI 客户端，并处理一次性授权码换 Token
-
-        新版接入模型：
-        1. 在 HDHive 创建 OpenAPI 应用，审核通过后获得 client_id 和应用 Secret
-        2. 配置 client_id、应用 Secret、回调地址后保存，从日志中复制授权链接到浏览器完成授权
-        3. 将回调地址中的 code 参数填入"授权码"并保存，插件自动换取用户 Token
-        """
-        self._hdhive_client = None
-        if not self._hdhive_api_key:
-            return
-
-        client = HDHiveOpenAPIClient(
-            app_secret=self._hdhive_api_key,
-            client_id=self._hdhive_client_id,
-            access_token=self._hdhive_access_token,
-            refresh_token=self._hdhive_refresh_token,
-            token_expires_at=self._hdhive_token_expires_at,
-            proxy=proxy,
-            on_token_update=self._on_hdhive_token_update,
-        )
-        self._hdhive_client = client
-
-        # 一次性授权码换取用户 Token
-        if self._hdhive_auth_code:
-            auth_code = self._hdhive_auth_code
-            self._hdhive_auth_code = ""
-            if not self._hdhive_redirect_uri:
-                logger.error("HDHive OpenAPI: 已填写授权码但缺少回调地址（必须与发起授权时一致），无法换取 Token")
-                self.__update_config()
-            else:
-                try:
-                    data = client.exchange_code(auth_code, self._hdhive_redirect_uri)
-                    scopes = data.get("scope") or " ".join(data.get("scopes") or [])
-                    logger.info(f"HDHive OpenAPI: 用户授权成功，已获取 Access Token（scope: {scopes}）")
-                    self.__update_config()
-                except HDHiveOpenAPIError as e:
-                    logger.error(f"HDHive OpenAPI: 授权码换取 Token 失败: [{e.code}] {e.message} {e.description}")
-                    self.__update_config()
-                except Exception as e:
-                    logger.error(f"HDHive OpenAPI: 授权码换取 Token 异常: {e}")
-                    self.__update_config()
-
-        # 未完成授权时，打印授权链接引导用户操作
-        if not client.is_ready:
-            if self._hdhive_client_id and self._hdhive_redirect_uri:
-                authorize_url = client.build_authorize_url(self._hdhive_redirect_uri)
-                logger.warning(
-                    f"HDHive OpenAPI: 尚未完成用户授权，请在浏览器打开以下链接完成授权，"
-                    f"然后将回调地址中的 code 参数填入插件配置的「授权码」并保存：\n{authorize_url}"
-                )
-            else:
-                logger.warning("HDHive OpenAPI: 请先在 HDHive 申请 OpenAPI 应用，并在插件中配置 Client ID、应用 Secret 和回调地址")
-
     def _init_subscribe_handler(self):
         self._subscribe_handler = SubscribeHandler(
             exclude_subscribes=self._exclude_subscribes,
@@ -1224,17 +1109,8 @@ class P115SubSearch(_PluginBase):
         self._search_handler = SearchHandler(
             pansou_client=self._pansou_client,
             nullbr_client=self._nullbr_client,
-            hdhive_client=self._hdhive_client,
             pansou_enabled=self._pansou_enabled,
             nullbr_enabled=self._nullbr_enabled,
-            hdhive_enabled=self._hdhive_enabled,
-            hdhive_query_mode=self._hdhive_query_mode,
-            hdhive_auto_unlock=self._hdhive_auto_unlock,
-            hdhive_max_unlock_points=self._hdhive_max_unlock_points,
-            hdhive_max_points_per_sub=self._hdhive_max_points_per_sub,
-            hdhive_username=self._hdhive_username,
-            hdhive_password=self._hdhive_password,
-            hdhive_cookie=self._hdhive_cookie,
             only_115=self._only_115,
             pansou_channels=self._pansou_channels,
             search_source_order=self._search_source_order,
@@ -1313,24 +1189,6 @@ class P115SubSearch(_PluginBase):
             "nullbr_enabled": self._nullbr_enabled,
             "nullbr_appid": self._nullbr_appid,
             "nullbr_api_key": self._nullbr_api_key,
-            # HDHive 配置
-            "hdhive_enabled": self._hdhive_enabled,
-            "hdhive_query_mode": self._hdhive_query_mode,
-            "hdhive_api_key": self._hdhive_api_key,
-            "hdhive_client_id": self._hdhive_client_id,
-            "hdhive_redirect_uri": self._hdhive_redirect_uri,
-            "hdhive_auth_code": self._hdhive_auth_code,
-            "hdhive_access_token": self._hdhive_access_token,
-            "hdhive_refresh_token": self._hdhive_refresh_token,
-            "hdhive_token_expires_at": self._hdhive_token_expires_at,
-            "hdhive_auto_unlock": self._hdhive_auto_unlock,
-            "hdhive_max_unlock_points": self._hdhive_max_unlock_points,
-            "hdhive_max_points_per_sub": self._hdhive_max_points_per_sub,
-            "hdhive_username": self._hdhive_username,
-            "hdhive_password": self._hdhive_password,
-            "hdhive_cookie": self._hdhive_cookie,
-            "hdhive_auto_refresh": self._hdhive_auto_refresh,
-            "hdhive_refresh_before": self._hdhive_refresh_before,
             # KDocs 配置
             "kdocs_enabled": self._kdocs_enabled,
             "kdocs_token": self._kdocs_token,
@@ -1551,8 +1409,11 @@ class P115SubSearch(_PluginBase):
             "error": str(error or "请填写登录凭证并保存配置"),
         }
 
-    def _p115_account_card(self) -> Dict[str, Any]:
-        """把 115 账户信息转换为通用卡片契约。"""
+    def _p115_account_card(self, silent: bool = False) -> Dict[str, Any]:
+        """把 115 账户信息转换为通用卡片契约。
+
+        :param silent: 透传给客户端，后台定时刷新时只写 debug 日志。
+        """
         manager = self._p115_manager
         if manager is None:
             return self._account_card_placeholder("115 客户端未初始化，请检查 Cookie 配置")
@@ -1572,7 +1433,7 @@ class P115SubSearch(_PluginBase):
                 f"115 Cookie 不完整，缺少：{'/'.join(missing_keys)}"
             )
 
-        info = manager.get_account_info()
+        info = manager.get_account_info(silent=silent)
         if not isinstance(info, dict) or not info.get("connected"):
             message = info.get("error") if isinstance(info, dict) else None
             return self._account_card_placeholder(
@@ -1741,24 +1602,28 @@ class P115SubSearch(_PluginBase):
 
     # ---- 核心：读卡片（带缓存与冷却） ----
 
-    def _load_account(self, account_key: str, allow_browser_login: bool = True) -> Dict[str, Any]:
+    def _load_account(
+            self, account_key: str, allow_browser_login: bool = True,
+            silent: bool = False,
+    ) -> Dict[str, Any]:
         """真正去取一次账户信息（会发网络请求）。"""
         normalized = self._normalize_account_key(account_key)
         if normalized == self.ACCOUNT_KEY_P115:
-            return self._p115_account_card()
+            return self._p115_account_card(silent=silent)
         if normalized == self.ACCOUNT_KEY_DIAN115:
             return self._dian115_account_card(allow_browser_login=allow_browser_login)
         raise ValueError(f"不支持的账户卡片：{normalized}")
 
     def _account_info(
             self, account_key: str, refresh: bool = False,
-            allow_browser_login: bool = True,
+            allow_browser_login: bool = True, silent: bool = False,
     ) -> Tuple[Dict[str, Any], bool]:
         """
         读取单卡片信息，使用独立快照并实施刷新冷却。
 
         :param allow_browser_login: 癫影 token 过期时是否允许浏览器自动登录
             （手动刷新必须 False，避免 HTTP 长阻塞；后台刷新用 True）。
+        :param silent: True 时不输出 info 级日志（后台/页面自动刷新用）。
         :return: (account, limited)；limited=True 表示因冷却未真正刷新。
             **异常路径不覆盖既有快照**——临时网络抖动不应把好快照冲成占位卡。
         """
@@ -1772,7 +1637,9 @@ class P115SubSearch(_PluginBase):
 
         _account_guard_arm(normalized)
         try:
-            account = self._load_account(normalized, allow_browser_login=allow_browser_login)
+            account = self._load_account(
+                normalized, allow_browser_login=allow_browser_login, silent=silent
+            )
         except Exception as error:
             logger.debug(f"读取账户信息失败（{normalized}）：{error}")
             placeholder = self._account_card_placeholder(
@@ -1958,8 +1825,27 @@ class P115SubSearch(_PluginBase):
             logger.debug(f"刷新 115 账户快照失败：{error}")
 
     def get_page(self) -> Optional[List[dict]]:
+        # v1.8.5：打开设置页时真实刷新一次 115 网盘 / 癫影账户，
+        # 页面渲染读的是快照，所以刷新必须在渲染之前完成。
+        self._refresh_accounts_on_page_open()
         history = self.get_data('history') or []
         return UIConfig.get_page(history)
+
+    def _refresh_accounts_on_page_open(self) -> None:
+        """打开配置页时刷新账户（静默 + 冷却，失败不影响页面渲染）。
+
+        - 115 与癫影各刷一次，单账户失败不影响另一个；
+        - 癫影禁止浏览器登录（冷启动 30s+ 会把设置页拖超时），
+          token 过期时交给后台自动刷新去重新登录；
+        - 命中 30 秒冷却时直接跳过，避免反复开关页面打接口。
+        """
+        for key in (self.ACCOUNT_KEY_P115, self.ACCOUNT_KEY_DIAN115):
+            try:
+                self._account_info(
+                    key, refresh=True, allow_browser_login=False, silent=True
+                )
+            except Exception as error:  # noqa: BLE001
+                logger.debug(f"打开配置页刷新账户失败（{key}）：{error}")
 
     def get_api(self) -> List[Dict[str, Any]]:
         return [
@@ -2077,10 +1963,11 @@ class P115SubSearch(_PluginBase):
         - 癫影走 get_account_info(allow_browser_login=True)，token 过期时
           自动重新登录并持久化，相当于同时完成会话保活；
         - 配置页保持零网络请求：页面只读快照，本服务保证快照足够新鲜。
+        - v1.8.5：全程 silent，后台刷新**不产生 info 级日志**。
         """
         for key in (self.ACCOUNT_KEY_P115, self.ACCOUNT_KEY_DIAN115):
             try:
-                account = self._load_account(key, allow_browser_login=True)
+                account = self._load_account(key, allow_browser_login=True, silent=True)
             except Exception as error:
                 logger.debug(f"自动刷新账户快照失败（{key}）：{error}")
                 continue
@@ -2166,13 +2053,13 @@ class P115SubSearch(_PluginBase):
 
     def _do_sync(self) -> bool:
         # 至少启用一个搜索源
-        if not self._pansou_enabled and not self._nullbr_enabled and not self._hdhive_enabled:
-            logger.error("搜索源均未启用（PanSou/Nullbr/HDHive），无法执行")
+        if not self._pansou_enabled and not self._nullbr_enabled:
+            logger.error("搜索源均未启用（PanSou/Nullbr），无法执行")
             if self._notify:
                 self.post_message(
                     mtype=NotificationType.Plugin,
                     title="【115网盘订阅搜索】配置错误",
-                    text="PanSou、Nullbr、HDHive 均未启用，请至少启用一个搜索源。"
+                    text="PanSou、Nullbr 均未启用，请至少启用一个搜索源。"
                 )
             return False
 

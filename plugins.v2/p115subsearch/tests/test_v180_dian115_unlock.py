@@ -8,7 +8,7 @@ v1.8.0 Dian115 积分解锁与预算控制测试
     U2  客户端 unlock_share 的请求体与响应解析（实扣积分、already、链接提取）
     U3  SearchHandler._search_dian115 的两级预算过滤与自动解锁开关
     U4  SearchHandler.unlock_dian115_resource 的预算拦截、幂等缓存、记账
-    U5  SyncHandler._unlock_pending_resource 的 HDHive / Dian115 分派
+    U5  SyncHandler._unlock_pending_resource 的 Dian115 分派
     U6  配置页默认值与主插件字段存在性（Tab 里的开关与预算都落到 default_config）
     U7  SimpleTTLCache 的 TTL、容量上限与并发安全基本语义
 
@@ -354,7 +354,7 @@ def make_search_handler(**overrides):
     install_stubs()
     mod = import_module("p115subsearch.handlers.search")
     kwargs = dict(
-        pansou_client=None, nullbr_client=None, hdhive_client=None,
+        pansou_client=None, nullbr_client=None,
         only_115=True,
     )
     kwargs.update(overrides)
@@ -581,15 +581,10 @@ def test_sync_dispatch():
     class FakeSearch:
         def __init__(self):
             self.dian_calls = []
-            self.hd_calls = []
 
         def unlock_dian115_resource(self, share_id, points):
             self.dian_calls.append((share_id, points))
             return f"https://115.com/s/d{share_id}" if share_id > 0 else ""
-
-        def unlock_hdhive_resource(self, slug, points):
-            self.hd_calls.append((slug, points))
-            return f"https://115.com/s/{slug}"
 
     install_stubs()
     sync_mod = import_module("p115subsearch.handlers.sync")
@@ -612,15 +607,7 @@ def test_sync_dispatch():
     check("U5-2 字段特征推断为 dian115",
           url2 == "https://115.com/s/d66", f"got={url2}")
 
-    # 5-3 HDHive 走原链路
-    obj._search_handler = FakeSearch()
-    url3 = obj._unlock_pending_resource(
-        {"slug": "abc", "unlock_points": 2}, "C")
-    check("U5-3 HDHive 仍走原解锁链路",
-          url3 == "https://115.com/s/abc"
-          and obj._search_handler.hd_calls == [("abc", 2)], f"got={url3}")
-
-    # 5-4 dian115 缺 share_id → 不解锁
+    # 5-3 dian115 缺 share_id → 不解锁
     obj._search_handler = FakeSearch()
     url4 = obj._unlock_pending_resource({"_source": "dian115", "unlock_points": 2}, "D")
     check("U5-4 dian115 缺 share_id 返回空", url4 == "")
@@ -664,8 +651,8 @@ def test_config_wiring():
     check("U6-透传 订阅预算",
           "dian115_max_points_per_sub=self._dian115_max_points_per_sub" in init_src)
 
-    # Tab 结构：六个 tab 都在
-    for tab in ("订阅", "签到", "盘搜", "癫影", "影巢", "金山文档"):
+    # Tab 结构：五个 tab 都在
+    for tab in ("订阅", "签到", "盘搜", "癫影", "金山文档"):
         check(f"U6-Tab「{tab}」存在", tab in ui_src)
 
     # SyncHandler 分派存在

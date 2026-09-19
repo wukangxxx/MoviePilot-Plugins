@@ -142,6 +142,22 @@ def _handler_module(manager=None, **kwargs):
     return mod, handler
 
 
+class LogRecorder:
+    """替换模块级 logger，捕获 warning 文本用于断言不泄露。"""
+
+    def __init__(self):
+        self.records = []
+
+    def warning(self, msg, *args, **kwargs):
+        self.records.append(str(msg))
+
+    info = error = debug = warning
+
+    @property
+    def blob(self):
+        return "\n".join(self.records)
+
+
 # ===========================================================================
 # 2. 纯解析：链接形态
 # ===========================================================================
@@ -296,7 +312,9 @@ def test_resolve_manager_exception_degrades():
     check("10-1 客户端异常不抛出", isinstance(result, dict), str(result))
     check("10-2 success=False", result["success"] is False, json.dumps(result, ensure_ascii=False))
     check("10-3 状态为 error", result["data"]["status"] == "error", str(result["data"]))
-    check("10-4 提示含原因", "502" in result["message"], result["message"])
+    check("10-4 提示为通用可操作中文（不回显异常详情）",
+          "重试" in result["message"] and "502" not in result["message"],
+          result["message"])
     check("10-5 异常响应不含访问码明文",
           "xyz1" not in json.dumps(result, ensure_ascii=False),
           json.dumps(result, ensure_ascii=False))
@@ -307,6 +325,64 @@ def test_resolve_manager_exception_degrades():
     check("10-6 解析异常降级为 invalid 或 error",
           result2["data"]["status"] in ("invalid", "error"), str(result2["data"]))
     check("10-7 解析异常也带提示", bool(result2["message"]), result2["message"])
+
+
+def test_exception_text_never_leaks_share_url_or_code():
+    """安全回归：异常文本可能内嵌完整分享链接 / 访问码，日志与响应都不得回显。
+
+    share_code 是解析出的非敏感字段（对外响应按设计保留），
+    这里断言的是完整分享 URL 与访问码明文均不出现。
+    """
+    leak_url = "https://115.com/s/leak9999?password=LEAKPWD7"
+    leak_pwd = "LEAKPWD7"
+
+    # 场景一：extract_share_info 抛出的异常内嵌分享链接与访问码
+    mod1, handler1 = _handler_module(FakeManager(
+        extract_error=RuntimeError(f"transfer failed for {leak_url} pwd={leak_pwd}")))
+    rec1 = LogRecorder()
+    mod1.logger = rec1
+    result1 = handler1.resolve(leak_url)
+    blob1 = json.dumps(result1, ensure_ascii=False)
+
+    check("14-1 解析异常不抛出", isinstance(result1, dict), str(result1))
+    check("14-2 解析异常 success=False", result1["success"] is False, blob1)
+    check("14-3 解析异常仍为 error 状态", result1["data"]["status"] == "error", str(result1["data"]))
+    check("14-4 解析异常响应不含分享 URL", leak_url not in blob1, blob1)
+    check("14-5 解析异常响应不含访问码明文", leak_pwd not in blob1, blob1)
+    check("14-6 解析异常响应不含异常原文", "transfer failed" not in blob1, blob1)
+    check("14-7 解析异常告警日志不含分享 URL", leak_url not in rec1.blob, rec1.blob)
+    check("14-8 解析异常告警日志不含访问码明文", leak_pwd not in rec1.blob, rec1.blob)
+    check("14-9 解析异常告警日志不含异常原文", "transfer failed" not in rec1.blob, rec1.blob)
+    check("14-10 解析异常仍有 warning 记录", len(rec1.records) >= 1, str(rec1.records))
+    check("14-11 解析异常提示通用且可操作",
+          "解析失败" in result1["message"] and "重试" in result1["message"],
+          result1["message"])
+    check("14-12 解析异常保留非敏感 share_code",
+          result1["data"].get("share_code") == "leak9999", blob1)
+
+    # 场景二：check_share_status 抛出的异常内嵌分享链接与访问码
+    mod2, handler2 = _handler_module(FakeManager(
+        status_error=ValueError(f"bad status for {leak_url} code {leak_pwd}")))
+    rec2 = LogRecorder()
+    mod2.logger = rec2
+    result2 = handler2.resolve(leak_url)
+    blob2 = json.dumps(result2, ensure_ascii=False)
+
+    check("15-1 查询异常不抛出", isinstance(result2, dict), str(result2))
+    check("15-2 查询异常 success=False", result2["success"] is False, blob2)
+    check("15-3 查询异常仍为 error 状态", result2["data"]["status"] == "error", str(result2["data"]))
+    check("15-4 查询异常响应不含分享 URL", leak_url not in blob2, blob2)
+    check("15-5 查询异常响应不含访问码明文", leak_pwd not in blob2, blob2)
+    check("15-6 查询异常响应不含异常原文", "bad status" not in blob2, blob2)
+    check("15-7 查询异常告警日志不含分享 URL", leak_url not in rec2.blob, rec2.blob)
+    check("15-8 查询异常告警日志不含访问码明文", leak_pwd not in rec2.blob, rec2.blob)
+    check("15-9 查询异常告警日志不含异常原文", "bad status" not in rec2.blob, rec2.blob)
+    check("15-10 查询异常仍有 warning 记录", len(rec2.records) >= 1, str(rec2.records))
+    check("15-11 查询异常提示通用且可操作",
+          "状态查询失败" in result2["message"] and "重试" in result2["message"],
+          result2["message"])
+    check("15-12 查询异常保留非敏感 share_code",
+          result2["data"].get("share_code") == "leak9999", blob2)
 
 
 def test_resolve_batch():
@@ -371,6 +447,7 @@ TESTS = [
     test_resolve_expired_and_deleted,
     test_resolve_password_required,
     test_resolve_manager_exception_degrades,
+    test_exception_text_never_leaks_share_url_or_code,
     test_resolve_batch,
     test_extract_links_from_text,
     test_no_cloudsubscribe_dependency,

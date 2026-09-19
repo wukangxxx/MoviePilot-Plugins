@@ -216,17 +216,27 @@ class ShareLinkHandler:
         if callable(extractor):
             try:
                 extractor(text)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(f"115 分享链接解析失败：{exc}")
-                return self._reply(False, f"链接解析失败：{exc}",
-                                   self._data(STATUS_ERROR, parsed, status_text="解析失败"))
+            except Exception:  # noqa: BLE001
+                # 异常文本可能内嵌完整分享链接 / 访问码，禁止写入日志或响应
+                logger.warning("115 分享链接解析失败（异常详情已隐藏）")
+                return self._reply(
+                    False,
+                    "115 分享链接解析失败，请稍后重试；"
+                    "若持续失败请检查链接格式是否正确",
+                    self._data(STATUS_ERROR, parsed, status_text="解析失败"),
+                )
 
         try:
             status = self._manager.check_share_status(text)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(f"115 分享状态查询失败：{exc}")
-            return self._reply(False, f"115 分享状态查询失败：{exc}",
-                               self._data(STATUS_ERROR, parsed, status_text="查询失败"))
+        except Exception:  # noqa: BLE001
+            # 异常文本可能内嵌完整分享链接 / 访问码，禁止写入日志或响应
+            logger.warning("115 分享状态查询失败（异常详情已隐藏）")
+            return self._reply(
+                False,
+                "115 分享状态查询失败，请稍后重试；"
+                "若持续失败请检查 115 账户是否正常",
+                self._data(STATUS_ERROR, parsed, status_text="查询失败"),
+            )
 
         if status is None:
             return self._reply(False, "115 未返回分享状态，请稍后重试",

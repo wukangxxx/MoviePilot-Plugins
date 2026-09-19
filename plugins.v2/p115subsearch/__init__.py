@@ -25,8 +25,10 @@ from app.plugins import _PluginBase
 from app.schemas.types import EventType, MediaType, NotificationType
 
 from .clients import (PanSouClient, P115ClientManager, NullbrClient,
-                      KDocsClient, KDocsError, Dian115Client, Dian115Error)
-from .handlers import SearchHandler, SyncHandler, SubscribeHandler, ApiHandler, CheckinHandler
+                      KDocsClient, KDocsError, Dian115Client, Dian115Error,
+                      LeaderboardClient, LeaderboardError)
+from .handlers import (SearchHandler, SyncHandler, SubscribeHandler, ApiHandler,
+                       CheckinHandler, LeaderboardHandler, ShareLinkHandler)
 from .ui import UIConfig
 
 lock = Lock()
@@ -136,7 +138,18 @@ class P115SubSearch(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/cloud.png"
     # 插件版本
-    plugin_version = "1.8.5"
+    plugin_version = "1.9.0"
+    # 版本历史（v1.9.0）：
+    #   * 新增「榜单」Tab：原生适配 MoviePilot RecommendChain（TMDB / 豆瓣榜单），
+    #     支持榜单浏览、媒体条目展示与一键订阅入口；来源为空或异常时优雅降级。
+    #   * 新增盘链能力：识别 / 解析用户输入或发送的 115 分享链接并给出明确状态，
+    #     非法、失效、需要访问码均有可操作中文提示，且不泄露任何敏感字段。
+    #   * 声明式界面接入：设置页新增「榜单」页签（来源多选 + 分页 / 缓存 /
+    #     后台刷新间隔），数据页新增只读榜单卡片与「刷新榜单」按钮，空状态与
+    #     降级提示均为中文文案；页面渲染保持零网络开销。
+    #   * 配置读写对称：榜单相关 5 个配置项在类属性 / init_plugin / UI 控件 /
+    #     update_config 四处齐全；原有 KDocs、PanSou 检测、多链接转存、
+    #     系统订阅屏蔽、dian115 签到 / 抽奖 / 离线处理能力全部保留。
     # 插件作者
     plugin_author = "mrtian2016"
     # 作者主页
@@ -222,6 +235,13 @@ class P115SubSearch(_PluginBase):
     _dian115_lottery_enabled: bool = False
     _dian115_lottery_count: int = 0
 
+    # 榜单订阅（v1.9.0）—— 榜单浏览 / 订阅入口，数据来自 MoviePilot 原生推荐链
+    _leaderboard_enabled: bool = False
+    _leaderboard_sources: List[str] = []
+    _leaderboard_page_size: int = 20
+    _leaderboard_cache_minutes: int = 30
+    _leaderboard_refresh_minutes: int = 0
+
     # 是否屏蔽系统订阅（True=已屏蔽系统订阅，False=已恢复系统订阅）
     _block_system_subscribe: bool = False
 
@@ -250,6 +270,10 @@ class P115SubSearch(_PluginBase):
     _sync_handler: Optional[SyncHandler] = None
     _checkin_handler: Optional[CheckinHandler] = None
     _api_handler: Optional[ApiHandler] = None
+    # v1.9.0：榜单订阅与盘链处理器
+    _leaderboard_client: Optional[LeaderboardClient] = None
+    _leaderboard_handler: Optional[LeaderboardHandler] = None
+    _share_link_handler: Optional[ShareLinkHandler] = None
 
     # v1.7.3 恢复 cron 最小间隔限制（v1.7.2 曾取消，阈值从 8 小时调整为 4 小时）
     _MIN_INTERVAL_HOURS: int = 4
@@ -889,6 +913,26 @@ class P115SubSearch(_PluginBase):
             backup = config.get("rss_sites_backup")
             self._rss_sites_backup = list(backup) if isinstance(backup, (list, tuple)) and backup else None
 
+            # 榜单订阅（v1.9.0）：榜单来源为 MoviePilot 推荐链方法名，
+            # 只做浏览与订阅入口；抓取一律走缓存 / 后台刷新，不进搜索热路径
+            self._leaderboard_enabled = bool(config.get("leaderboard_enabled") or False)
+            self._leaderboard_sources = [
+                str(item).strip() for item in (list(config.get("leaderboard_sources") or []))
+                if str(item).strip()
+            ]
+            try:
+                self._leaderboard_page_size = max(1, min(int(config.get("leaderboard_page_size") or 20), 100))
+            except (TypeError, ValueError):
+                self._leaderboard_page_size = 20
+            try:
+                self._leaderboard_cache_minutes = max(1, min(int(config.get("leaderboard_cache_minutes") or 30), 1440))
+            except (TypeError, ValueError):
+                self._leaderboard_cache_minutes = 30
+            try:
+                self._leaderboard_refresh_minutes = max(0, min(int(config.get("leaderboard_refresh_minutes") or 0), 1440))
+            except (TypeError, ValueError):
+                self._leaderboard_refresh_minutes = 0
+
         # 初始化客户端/handlers
         self._init_clients()
         self._init_handlers()
@@ -1166,6 +1210,21 @@ class P115SubSearch(_PluginBase):
             save_data_func=self.save_data
         )
 
+        # v1.9.0：榜单订阅（缓存 + 订阅入口）与盘链能力（只读识别/校验）
+        # 订阅链不在此处 new：LeaderboardHandler 内部按需构造 SubscribeChain()，
+        # 与 handlers/subscribe.py 的既有用法保持一致（PluginChian 不暴露 subscribe）
+        self._leaderboard_client = LeaderboardClient(
+            cache_ttl_seconds=max(1, self._leaderboard_cache_minutes) * 60,
+            page_size=self._leaderboard_page_size
+        )
+        self._leaderboard_handler = LeaderboardHandler(
+            client=self._leaderboard_client,
+            subscribe_oper=SubscribeOper(),
+            get_data_func=self.get_data,
+            save_data_func=self.save_data
+        )
+        self._share_link_handler = ShareLinkHandler(p115_manager=self._p115_manager)
+
     # ------------------ 配置写回 ------------------
 
     def __update_config(self):
@@ -1218,6 +1277,12 @@ class P115SubSearch(_PluginBase):
             "dian115_checkin_mode": self._dian115_checkin_mode,
             "dian115_lottery_enabled": self._dian115_lottery_enabled,
             "dian115_lottery_count": self._dian115_lottery_count,
+            # 榜单订阅（v1.9.0）
+            "leaderboard_enabled": bool(self._leaderboard_enabled),
+            "leaderboard_sources": list(self._leaderboard_sources or []),
+            "leaderboard_page_size": int(self._leaderboard_page_size),
+            "leaderboard_cache_minutes": int(self._leaderboard_cache_minutes),
+            "leaderboard_refresh_minutes": int(self._leaderboard_refresh_minutes),
             # 其他配置
             "search_source_order": self._search_source_order,
             "subscribe_filter_mode": self._subscribe_filter_mode,
@@ -1810,6 +1875,96 @@ class P115SubSearch(_PluginBase):
             },
         }
 
+    # ------------------ 榜单订阅 / 盘链 API（v1.9.0） ------------------
+
+    def api_leaderboard_browse(self, source: str = "", page: int = 1,
+                               refresh: bool = False) -> dict:
+        """浏览榜单：默认读缓存，refresh=true 才回源（仍由客户端自降级）。"""
+        if not self._leaderboard_handler:
+            return {"success": False, "message": "榜单功能未初始化，请重启插件后重试",
+                    "data": {"items": [], "empty": True}}
+        return self._leaderboard_handler.browse({
+            "source": source, "page": page, "refresh": refresh,
+        })
+
+    def api_leaderboard_subscribe(self, payload: Optional[dict] = None) -> dict:
+        """订阅榜单条目：复用 MoviePilot 原生 SubscribeChain 完成识别与建订。"""
+        if not self._leaderboard_handler:
+            return {"success": False, "message": "榜单功能未初始化，请重启插件后重试",
+                    "data": {"results": []}}
+        return self._leaderboard_handler.subscribe(payload or {})
+
+    def api_resolve_share_link(self, text: str = "") -> dict:
+        """解析并校验 115 分享链接；响应不包含访问码明文。"""
+        if not self._share_link_handler:
+            return {"success": False, "message": "盘链功能未初始化，请重启插件后重试",
+                    "data": {"status": "error", "is_share_link": False}}
+        return self._share_link_handler.resolve(text or "")
+
+    def api_refresh_leaderboard(self) -> dict:
+        """手动刷新榜单快照（v1.9.0）。
+
+        榜单是慢源，**绝不在请求线程里同步抓取**：这里只把一个一次性任务丢进
+        后台调度器后立即返回，抓取结果由后台写入本地快照，用户稍后重新打开
+        数据页即可看到。调度失败也返回结构化中文提示，不抛异常。
+        """
+        if not self._leaderboard_handler:
+            return {"success": False, "message": "榜单功能未初始化，请重启插件后重试",
+                    "data": {"scheduled": False}}
+        if not self._leaderboard_sources:
+            return {"success": False,
+                    "message": "尚未勾选榜单来源，请先在「榜单」页签选择来源并保存配置",
+                    "data": {"scheduled": False}}
+        try:
+            self._ensure_toggle_scheduler()
+            self._toggle_scheduler.add_job(
+                func=self._refresh_leaderboard_snapshot,
+                trigger="date",
+                run_date=datetime.datetime.now(pytz.timezone(settings.TZ)),
+                id="p115_leaderboard_refresh_job",
+                replace_existing=True
+            )
+        except Exception as error:  # noqa: BLE001
+            logger.warning(f"榜单刷新任务调度失败：{error}")
+            return {"success": False, "message": f"榜单刷新任务调度失败：{error}",
+                    "data": {"scheduled": False}}
+        return {"success": True, "message": "已提交榜单刷新任务，请稍后重新打开本页查看结果",
+                "data": {"scheduled": True}}
+
+    def _refresh_leaderboard_snapshot(self) -> Optional[Dict[str, Any]]:
+        """后台预热榜单缓存（v1.9.0）。
+
+        只在后台调度器 / 独立 cron 服务里跑：外部榜单源是慢源，**严禁**进入
+        订阅/搜索同步热路径。任何异常都在 handler 内部消化，这里再兜一层，
+        绝不影响主流程。返回值仅供手动刷新的 API 汇总，cron 服务忽略它。
+        """
+        if not self._leaderboard_handler:
+            return None
+        sources = list(self._leaderboard_sources or [])
+        if not sources:
+            return None
+        try:
+            return self._leaderboard_handler.refresh_snapshot(sources)
+        except Exception as error:  # noqa: BLE001
+            logger.debug(f"榜单后台刷新失败：{error}")
+            return None
+
+    def _build_leaderboard_service(self) -> List[Dict[str, Any]]:
+        """榜单后台刷新服务：仅当开启榜单且刷新间隔 > 0 时注册。"""
+        if not self._leaderboard_enabled or self._leaderboard_refresh_minutes <= 0:
+            return []
+        try:
+            return [{
+                "id": "P115SubSearchLeaderboard",
+                "name": "115网盘订阅搜索 榜单刷新服务",
+                "trigger": "interval",
+                "func": self._refresh_leaderboard_snapshot,
+                "kwargs": {"minutes": self._leaderboard_refresh_minutes}
+            }]
+        except Exception as error:  # noqa: BLE001
+            logger.warning(f"榜单刷新服务注册失败：{error}")
+            return []
+
     def _refresh_p115_account_snapshot(self) -> None:
         """
         登录校验通过后刷新 115 账户快照，供配置页展示（v1.8.3）。
@@ -1829,7 +1984,14 @@ class P115SubSearch(_PluginBase):
         # 页面渲染读的是快照，所以刷新必须在渲染之前完成。
         self._refresh_accounts_on_page_open()
         history = self.get_data('history') or []
-        return UIConfig.get_page(history)
+        # v1.9.0：榜单页签只读本地快照（零网络），榜单数据由后台刷新服务预热
+        leaderboard_snapshot = []
+        if self._leaderboard_handler:
+            try:
+                leaderboard_snapshot = self._leaderboard_handler.snapshot()
+            except Exception as error:  # noqa: BLE001
+                logger.debug(f"读取榜单快照失败：{error}")
+        return UIConfig.get_page(history, leaderboard_snapshot)
 
     def _refresh_accounts_on_page_open(self) -> None:
         """打开配置页时刷新账户（静默 + 冷却，失败不影响页面渲染）。
@@ -1866,6 +2028,30 @@ class P115SubSearch(_PluginBase):
                 "endpoint": self.api_refresh_account,
                 "methods": ["POST"],
                 "summary": "刷新账户信息卡片"
+            },
+            {
+                "path": "/leaderboard/browse",
+                "endpoint": self.api_leaderboard_browse,
+                "methods": ["GET", "POST"],
+                "summary": "浏览榜单（走本地缓存，失败优雅降级）"
+            },
+            {
+                "path": "/leaderboard/subscribe",
+                "endpoint": self.api_leaderboard_subscribe,
+                "methods": ["POST"],
+                "summary": "订阅榜单媒体条目"
+            },
+            {
+                "path": "/leaderboard/refresh",
+                "endpoint": self.api_refresh_leaderboard,
+                "methods": ["GET", "POST"],
+                "summary": "后台刷新榜单快照（不阻塞请求线程）"
+            },
+            {
+                "path": "/resolve_share_link",
+                "endpoint": self.api_resolve_share_link,
+                "methods": ["POST"],
+                "summary": "解析并校验 115 分享链接状态"
             }
         ]
     
@@ -2005,6 +2191,9 @@ class P115SubSearch(_PluginBase):
 
         # 账户快照自动刷新（v1.8.4）：配置页「自动刷新」的数据来源
         services.extend(self._build_account_refresh_service())
+
+        # 榜单后台刷新（v1.9.0）：慢源只走后台，配置页只读本地快照
+        services.extend(self._build_leaderboard_service())
 
         if not self._enabled:
             return services

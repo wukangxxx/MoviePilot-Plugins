@@ -235,7 +235,6 @@ class LeaderboardHandler:
             "tmdbid": tmdb_id,
             "doubanid": douban_id,
             "season": season,
-            "channel": "P115SubSearch",
             "source": f"榜单订阅·{source_name}",
             "message": False,
         }

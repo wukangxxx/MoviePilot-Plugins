@@ -404,13 +404,13 @@ check("C3-3 历史不超过上限 100",
 ui_src = SRC_UI
 tab_values = re.findall(r"'value': '(\w+_tab)'", ui_src)
 expected_tabs = ["subscribe_tab", "checkin_tab", "pansou_tab",
-                 "dian115_tab", "kdocs_tab"]
+                 "dian115_tab", "kdocs_tab", "leaderboard_tab"]
 # VTabs 区域只应出现一次（VWindow 中复用同样字符串，去重后比对顺序）
 seen = []
 for v in tab_values:
     if v not in seen:
         seen.append(v)
-check("D1 五个 Tab 齐备且顺序正确", seen == expected_tabs, f"actual={seen}")
+check("D1 六个 Tab 齐备且顺序正确", seen == expected_tabs, f"actual={seen}")
 
 models = sorted(set(re.findall(r"'model': '([a-z0-9_]+)'", ui_src)))
 # 下划线开头的是 Tab 内部状态键（如 _tabs），不参与配置持久化

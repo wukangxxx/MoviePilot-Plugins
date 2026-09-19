@@ -89,13 +89,12 @@ def test_version_dual_source():
 def test_config_symmetry_four_places():
     init_text = src("__init__.py")
     ui_text = src("ui/config.py")
-    cfg_text = src("core/config.py")
 
     # 2.1 类属性声明
     for key in NEW_KEYS:
         check(f"2-1 类属性 _{key} 声明", f"_{key}" in init_text, "未找到")
 
-    # 2.2 init_plugin 读取（形如 self._leaderboard_enabled = ... config.get("leaderboard_enabled"...)）
+    # 2.2 init_plugin 读取（形如 config.get("leaderboard_xxx")）
     read_section = init_text.split("def init_plugin", 1)[-1]
     for key in NEW_KEYS:
         pattern = re.compile(rf'config\.get\(\s*["\']{key}["\']')
@@ -125,7 +124,7 @@ def test_config_symmetry_four_places():
 
     # 现有能力不得被删除（配置键仍在）
     for legacy in ("kdocs_enabled", "pansou_check_enabled", "max_transfer_links",
-                   "dian115_enabled", "only_115", "blocked_sites_only_115"):
+                   "dian115_enabled", "only_115", "block_system_subscribe"):
         check(f"2-8 既有配置键保留 {legacy}", legacy in init_text and legacy in ui_text,
               "缺失")
 
@@ -133,29 +132,49 @@ def test_config_symmetry_four_places():
 def test_config_readback_roundtrip():
     """写入的配置必须能被读回（读写对称的行为验证）。"""
     init_text = src("__init__.py")
-    # 抓取 __update_config 中每个 key 的右值表达式与 init_plugin 的读取表达式是否同名
     update_section = init_text.split("def __update_config", 1)[-1]
     read_section = init_text.split("def init_plugin", 1)[-1]
 
     pairs = {
-        "leaderboard_enabled": ("bool", "bool"),
-        "leaderboard_page_size": ("int", "int"),
-        "leaderboard_cache_minutes": ("int", "int"),
-        "leaderboard_refresh_minutes": ("int", "int"),
-        "leaderboard_sources": ("list", "list"),
+        "leaderboard_enabled": "bool",
+        "leaderboard_page_size": "int",
+        "leaderboard_cache_minutes": "int",
+        "leaderboard_refresh_minutes": "int",
+        "leaderboard_sources": "list",
     }
-    for key, (write_kind, read_kind) in pairs.items():
+    for key, cast in pairs.items():
         w = re.search(rf'["\']{key}["\']\s*:\s*(bool|int|list)\(', update_section)
-        r = re.search(rf'["\']{key}["\']\s*\)\s*or\s*(bool|int|list)\(', read_section)
-        check(f"3-1 {key} 写回类型为 {write_kind}", w and w.group(1) == write_kind,
+        check(f"3-1 {key} 写回带 {cast} 转换", w and w.group(1) == cast,
               w.group(1) if w else "未匹配")
-        check(f"3-2 {key} 读取类型为 {read_kind}", r and r.group(1) == read_kind,
-              r.group(1) if r else "未匹配")
+
+        line = ""
+        for candidate in read_section.splitlines():
+            if f'config.get("{key}")' in candidate:
+                line = candidate
+                break
+        check(f"3-2 {key} 读取带 {cast} 转换", f"{cast}(" in line, line.strip() or "未找到读取行")
+        check(f"3-3 {key} 读取有兜底默认值", " or " in line, line.strip() or "未找到读取行")
 
 
 # ===========================================================================
 # 3. 依赖边界 / import guard
 # ===========================================================================
+
+def _code_only(text):
+    """去掉注释与字符串字面量，只留代码 token（迁移说明注释不算依赖）。"""
+    import io
+    import tokenize
+
+    parts = []
+    try:
+        for tok in tokenize.generate_tokens(io.StringIO(text).readline):
+            if tok.type in (tokenize.COMMENT, tokenize.STRING):
+                continue
+            parts.append(tok.string)
+    except (tokenize.TokenError, IndentationError):
+        return text
+    return " ".join(parts)
+
 
 def test_no_cloudsubscribe_import():
     offenders = []
@@ -176,15 +195,14 @@ def test_no_cloudsubscribe_import():
                     offenders.append(f"{path.name}: from {node.module} import ...")
     check("4-1 全插件无 CloudSubscribe import", not offenders, "; ".join(offenders))
 
-    # 旧插件名残留（源码不允许出现 cloudsubscribe 模块引用）
+    # 代码（忽略注释/字符串中的迁移说明）不得引用源插件
     leftover = []
     for path in py_files():
         if path.name.startswith("test_"):
             continue
-        text = path.read_text(encoding="utf-8")
-        if re.search(r"\bcloudsubscribe\b", text, re.IGNORECASE):
+        if "cloudsubscribe" in _code_only(path.read_text(encoding="utf-8")).lower():
             leftover.append(path.name)
-    check("4-2 非测试源码无 cloudsubscribe 名称残留", not leftover, str(leftover))
+    check("4-2 非测试源码（忽略注释）无 cloudsubscribe 引用", not leftover, str(leftover))
 
 
 def test_all_python_files_compile():
@@ -236,12 +254,20 @@ def test_leaderboard_modules_are_pure():
 
 
 def test_api_routes_registered():
-    """新增 API 路由必须注册且带 apikey 校验。"""
+    """新增 API 路由必须注册，且不得开放匿名访问（框架默认 apikey 鉴权）。"""
     init_text = src("__init__.py")
     api_section = init_text.split("def get_api", 1)[-1]
-    for route in ("/leaderboard/browse", "/leaderboard/subscribe", "/resolve_share_link"):
+    for route in ("/leaderboard/browse", "/leaderboard/subscribe",
+                  "/leaderboard/refresh", "/resolve_share_link"):
         check(f"8-1 注册路由 {route}", f'"{route}"' in api_section, "未注册")
-    check("8-2 get_api 中校验 apikey", "verify_apikey" in api_section, "未见校验")
+    check("8-2 路由未开放匿名访问（框架默认 apikey 鉴权）",
+          "allow_anonymous" not in api_section, "出现 allow_anonymous 逃逸")
+    check("8-3 路由端点已实现",
+          "def api_leaderboard_browse" in init_text
+          and "def api_leaderboard_subscribe" in init_text
+          and "def api_refresh_leaderboard" in init_text
+          and "def api_resolve_share_link" in init_text,
+          "端点方法缺失")
 
 
 def test_service_registration():

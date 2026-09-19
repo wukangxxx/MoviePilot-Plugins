@@ -99,6 +99,9 @@ sys.modules['p115subsearch.clients'].KDocsClient = object
 sys.modules['p115subsearch.clients'].KDocsError = Exception
 sys.modules['p115subsearch.clients'].Dian115Client = object
 sys.modules['p115subsearch.clients'].Dian115Error = Exception
+# v1.9.0：榜单客户端（惰性降级，测试只保证可构造）
+sys.modules['p115subsearch.clients'].LeaderboardClient = lambda **k: types.SimpleNamespace()
+sys.modules['p115subsearch.clients'].LeaderboardError = Exception
 sys.modules['p115subsearch.handlers'].SearchHandler = lambda **k: types.SimpleNamespace()
 sys.modules['p115subsearch.handlers'].SyncHandler = lambda **k: types.SimpleNamespace()
 sys.modules['p115subsearch.handlers'].SubscribeHandler = lambda **k: types.SimpleNamespace(
@@ -106,6 +109,9 @@ sys.modules['p115subsearch.handlers'].SubscribeHandler = lambda **k: types.Simpl
 )
 sys.modules['p115subsearch.handlers'].ApiHandler = lambda **k: types.SimpleNamespace()
 sys.modules['p115subsearch.handlers'].CheckinHandler = lambda **k: types.SimpleNamespace()
+# v1.9.0：榜单处理器与盘链处理器
+sys.modules['p115subsearch.handlers'].LeaderboardHandler = lambda **k: types.SimpleNamespace()
+sys.modules['p115subsearch.handlers'].ShareLinkHandler = lambda **k: types.SimpleNamespace()
 sys.modules['p115subsearch.ui'].UIConfig = types.SimpleNamespace(get_form=lambda: ([], {}), get_page=lambda h: [])
 
 # 外部依赖桩（__init__.py 顶部 import）

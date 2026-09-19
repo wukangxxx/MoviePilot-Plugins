@@ -7,7 +7,9 @@ from .pansou import PanSouClient
 from .nullbr import NullbrClient
 from .kdocs import KDocsClient, KDocsError
 from .dian115 import Dian115Client, Dian115Error
-from .leaderboard import LeaderboardClient, LeaderboardError, LEADERBOARD_SOURCES
+from .leaderboard import (LeaderboardClient, LeaderboardError, LEADERBOARD_SOURCES,
+                          DEFAULT_LEADERBOARD_SOURCES, default_leaderboard_sources,
+                          normalize_source_ids, resolve_source_ids)
 
 __all__ = [
     "P115ClientManager",
@@ -19,5 +21,9 @@ __all__ = [
     "Dian115Error",
     "LeaderboardClient",
     "LeaderboardError",
-    "LEADERBOARD_SOURCES"
+    "LEADERBOARD_SOURCES",
+    "DEFAULT_LEADERBOARD_SOURCES",
+    "default_leaderboard_sources",
+    "normalize_source_ids",
+    "resolve_source_ids"
 ]

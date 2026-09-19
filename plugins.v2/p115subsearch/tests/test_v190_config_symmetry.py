@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-P115SubSearch v1.9.0 测试（三）：配置读写对称 / 版本双源同步 / 依赖边界
+P115SubSearch v1.9.1 测试（三）：配置读写对称 / 版本双源同步 / 依赖边界
 
 对齐任务书「历史经验」：
     * 版本号必须双源同步（package.v2.json + __init__.py plugin_version）；
@@ -45,7 +45,7 @@ def py_files():
     return sorted(p for p in PLUGIN.rglob("*.py") if "__pycache__" not in str(p))
 
 
-# v1.9.0 新增的配置键
+# v1.9.1 新增的配置键
 NEW_KEYS = [
     "leaderboard_enabled",
     "leaderboard_sources",
@@ -63,23 +63,23 @@ def test_version_dual_source():
     init_text = src("__init__.py")
     match = re.search(r'plugin_version\s*=\s*["\']([^"\']+)["\']', init_text)
     check("1-1 __init__.py 存在 plugin_version", match is not None, "未找到")
-    check("1-2 plugin_version 为 1.9.0", match and match.group(1) == "1.9.0",
+    check("1-2 plugin_version 为 1.9.1", match and match.group(1) == "1.9.1",
           match.group(1) if match else "?")
 
     pkg = json.loads((REPO / "package.v2.json").read_text(encoding="utf-8"))
     entry = pkg.get("P115SubSearch")
     check("1-3 package.v2.json 存在 P115SubSearch 条目", entry is not None, "缺失")
-    check("1-4 package.v2.json version 为 1.9.0",
-          entry and entry.get("version") == "1.9.0",
+    check("1-4 package.v2.json version 为 1.9.1",
+          entry and entry.get("version") == "1.9.1",
           str(entry.get("version")) if entry else "?")
-    check("1-5 package.v2.json 有 v1.9.0 中文 history",
-          entry and isinstance(entry.get("history"), dict) and "v1.9.0" in entry["history"],
+    check("1-5 package.v2.json 有 v1.9.1 中文 history",
+          entry and isinstance(entry.get("history"), dict) and "v1.9.1" in entry["history"],
           str(list((entry or {}).get("history", {}))[:3]))
-    note = (entry or {}).get("history", {}).get("v1.9.0", "")
+    note = (entry or {}).get("history", {}).get("v1.9.1", "")
     check("1-6 history 文案为中文且非空",
           bool(note) and any("一" <= ch <= "鿿" for ch in note), note)
-    check("1-7 __init__.py 版本历史含 v1.9.0",
-          "v1.9.0" in init_text, "未找到 v1.9.0 说明")
+    check("1-7 __init__.py 版本历史含 v1.9.1",
+          "v1.9.1" in init_text, "未找到 v1.9.1 说明")
 
 
 # ===========================================================================
@@ -117,10 +117,13 @@ def test_config_symmetry_four_places():
         check(f"2-5 default_config 含 {key}", bool(pattern.search(defaults)),
               "default_config 中未出现")
 
-    check("2-6 榜单开关默认关闭", re.search(r'["\']leaderboard_enabled["\']\s*:\s*False', defaults)
-          is not None, "默认值不是 False")
-    check("2-7 榜单来源为空列表", re.search(r'["\']leaderboard_sources["\']\s*:\s*\[\]', defaults)
-          is not None, "默认值不是 []")
+    # v1.9.1：首次使用即为可用状态 —— 默认启用 + 安全默认来源
+    check("2-6 榜单开关默认启用", re.search(r'["\']leaderboard_enabled["\']\s*:\s*True', defaults)
+          is not None, "默认值不是 True")
+    check("2-7 榜单来源默认为安全来源常量",
+          re.search(r'["\']leaderboard_sources["\']\s*:\s*list\(\s*DEFAULT_LEADERBOARD_SOURCES\s*\)',
+                    defaults) is not None,
+          "默认值未引用 DEFAULT_LEADERBOARD_SOURCES")
 
     # 现有能力不得被删除（配置键仍在）
     for legacy in ("kdocs_enabled", "pansou_check_enabled", "max_transfer_links",
@@ -130,19 +133,21 @@ def test_config_symmetry_four_places():
 
 
 def test_config_readback_roundtrip():
-    """写入的配置必须能被读回（读写对称的行为验证）。"""
+    """写入的配置必须能被读回（读写对称的行为验证）。
+
+    v1.9.1：榜单开关与来源的读取改为「缺省即首次使用」语义 —— 开关用
+    None 判断兜底为 True，来源统一交给 ``resolve_source_ids`` 归一化并在
+    启用但空来源时回落安全默认来源。
+    """
     init_text = src("__init__.py")
     update_section = init_text.split("def __update_config", 1)[-1]
     read_section = init_text.split("def init_plugin", 1)[-1]
 
-    pairs = {
-        "leaderboard_enabled": "bool",
-        "leaderboard_page_size": "int",
-        "leaderboard_cache_minutes": "int",
-        "leaderboard_refresh_minutes": "int",
-        "leaderboard_sources": "list",
-    }
-    for key, cast in pairs.items():
+    for key, cast in (
+        ("leaderboard_page_size", "int"),
+        ("leaderboard_cache_minutes", "int"),
+        ("leaderboard_refresh_minutes", "int"),
+    ):
         w = re.search(rf'["\']{key}["\']\s*:\s*(bool|int|list)\(', update_section)
         check(f"3-1 {key} 写回带 {cast} 转换", w and w.group(1) == cast,
               w.group(1) if w else "未匹配")
@@ -154,6 +159,30 @@ def test_config_readback_roundtrip():
                 break
         check(f"3-2 {key} 读取带 {cast} 转换", f"{cast}(" in line, line.strip() or "未找到读取行")
         check(f"3-3 {key} 读取有兜底默认值", " or " in line, line.strip() or "未找到读取行")
+
+    # 榜单开关：写回 bool(...)，读取用 None 判定兜底为 True（首次使用默认启用）
+    check("3-4 leaderboard_enabled 写回带 bool 转换",
+          re.search(r'["\']leaderboard_enabled["\']\s*:\s*bool\(', update_section) is not None,
+          "写回未带 bool 转换")
+    check("3-5 leaderboard_enabled 读取缺省兜底为 True",
+          'config.get("leaderboard_enabled")' in read_section
+          and re.search(r'if\s+raw_leaderboard_enabled\s+is\s+None\s*:\s*\n\s*raw_leaderboard_enabled\s*=\s*True',
+                        read_section) is not None,
+          "未找到首次使用默认启用兜底")
+    check("3-6 leaderboard_enabled 读取带 bool 转换",
+          "bool(raw_leaderboard_enabled)" in read_section, "读取未带 bool 转换")
+
+    # 榜单来源：写回 list(...)，读取交 resolve_source_ids 归一化 + 安全默认兜底
+    check("3-7 leaderboard_sources 写回带 list 转换",
+          re.search(r'["\']leaderboard_sources["\']\s*:\s*list\(', update_section) is not None,
+          "写回未带 list 转换")
+    check("3-8 leaderboard_sources 读取经 resolve_source_ids 归一化",
+          re.search(r'resolve_source_ids\(\s*\n?\s*config\.get\("leaderboard_sources"\)',
+                    read_section) is not None,
+          "读取未走 resolve_source_ids")
+    check("3-9 resolve_source_ids 已从 clients 导入",
+          "resolve_source_ids" in init_text.split("def init_plugin", 1)[0]
+          and "from .clients import" in init_text, "未导入 resolve_source_ids")
 
 
 # ===========================================================================
@@ -316,7 +345,7 @@ TESTS = [
 
 def main():
     print("=" * 68)
-    print("P115SubSearch v1.9.0 配置对称 / 版本 / 依赖边界测试")
+    print("P115SubSearch v1.9.1 配置对称 / 版本 / 依赖边界测试")
     print("=" * 68)
     for fn in TESTS:
         print()

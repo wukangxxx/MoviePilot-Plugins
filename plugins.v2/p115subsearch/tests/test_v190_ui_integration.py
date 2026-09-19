@@ -107,16 +107,21 @@ FORM, DEFAULTS = UIConfig.get_form()
 # ===========================================================================
 
 def test_form_defaults():
+    # v1.9.1：首次使用默认为「已启用 + 安全默认来源」，不再是不可用的关闭/空来源状态
     for key, expected in (
-        ("leaderboard_enabled", False),
-        ("leaderboard_sources", []),
+        ("leaderboard_enabled", True),
+        ("leaderboard_sources", ["tmdb_trending"]),
         ("leaderboard_page_size", 20),
         ("leaderboard_cache_minutes", 30),
         ("leaderboard_refresh_minutes", 0),
     ):
         check(f"1-1 default_config.{key} = {expected!r}",
               DEFAULTS.get(key) == expected, repr(DEFAULTS.get(key)))
-    check("1-2 default_config 原有键未被覆盖", DEFAULTS.get("max_transfer_links") == 5,
+    backend_ids = {item["id"] for item in _leaderboard_client.LEADERBOARD_SOURCES}
+    check("1-2 默认来源均在后端来源目录内",
+          set(DEFAULTS.get("leaderboard_sources") or []).issubset(backend_ids),
+          str(DEFAULTS.get("leaderboard_sources")))
+    check("1-3 default_config 原有键未被覆盖", DEFAULTS.get("max_transfer_links") == 5,
           repr(DEFAULTS.get("max_transfer_links")))
 
 
@@ -247,6 +252,47 @@ def test_card_content_and_tolerance():
           isinstance(empty_card, dict) and empty_card.get('component') == 'VCard', "")
 
 
+def test_share_link_card_routes_and_redacts_access_code():
+    """盘链卡片在两条数据页路径均可用，并只发输入字段到既有相对 API。"""
+    page_empty = UIConfig.get_page([])
+    page_history = UIConfig.get_page([{'status': '成功', 'type': '电影', 'title': 'T',
+                                       'time': '2026-09-19 10:00'}])
+
+    def locate_share_card(page):
+        for node in page:
+            if '115盘链解析' in str(node):
+                return node
+        return None
+
+    card_empty = locate_share_card(page_empty)
+    card_history = locate_share_card(page_history)
+    check('7-1 空历史数据页渲染 115盘链解析卡片', card_empty is not None, '')
+    check('7-2 有历史数据页渲染 115盘链解析卡片', card_history is not None, '')
+    card = card_empty or {}
+    flat = str(card)
+    check('7-3 卡片说明状态文件数与访问码提示',
+          '状态' in flat and '文件数量' in flat and '访问码' in flat, flat)
+    check('7-4 卡片不含任何访问码输入回显字段',
+          'receive_code' not in flat and 'password' not in flat.lower(), flat)
+
+    clicks = []
+    def walk(node):
+        if isinstance(node, dict):
+            event = node.get('events', {}).get('click') if isinstance(node.get('events'), dict) else None
+            if isinstance(event, dict):
+                clicks.append(event)
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, (list, tuple)):
+            for value in node:
+                walk(value)
+    walk(card)
+    check('7-5 盘链按钮调用既有相对解析路由',
+          len(clicks) == 1 and clicks[0].get('api') == 'plugin/P115SubSearch/resolve_share_link', str(clicks))
+    check('7-6 盘链按钮只提交文本模型，不携带访问码字段',
+          len(clicks) == 1 and clicks[0].get('params') == {'text': 'share_link_text'}, str(clicks))
+
+
 def test_refresh_button_targets_registered_route():
     card = UIConfig._leaderboard_card(SNAPSHOT)
     clicks = []
@@ -313,6 +359,7 @@ TESTS = [
     test_tab_registered_in_both_containers,
     test_page_renders_card_on_both_paths,
     test_card_content_and_tolerance,
+    test_share_link_card_routes_and_redacts_access_code,
     test_refresh_button_targets_registered_route,
     test_no_network_on_page_render,
 ]

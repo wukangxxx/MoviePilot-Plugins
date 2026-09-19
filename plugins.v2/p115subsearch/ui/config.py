@@ -11,9 +11,11 @@ from sqlalchemy import text
 
 try:
     # 榜单来源目录与后端共用同一份定义，避免 UI 与客户端清单漂移（v1.9.0）
-    from ..clients.leaderboard import LEADERBOARD_SOURCES
-except Exception:  # pragma: no cover - 脱离插件包单独加载时退化为空目录
+    # v1.9.1：默认来源同样取后端常量，保证「首次使用」默认值与来源目录同源
+    from ..clients.leaderboard import LEADERBOARD_SOURCES, DEFAULT_LEADERBOARD_SOURCES
+except Exception:  # pragma: no cover - 脱离插件包单独加载时退化为内置常量
     LEADERBOARD_SOURCES = []
+    DEFAULT_LEADERBOARD_SOURCES = ["tmdb_trending"]
 
 
 class UIConfig:
@@ -818,7 +820,8 @@ class UIConfig:
         # ============ Tab 6：榜单（v1.9.0） ============
         leaderboard_tab: List[Dict[str, Any]] = [
             UIConfig._alert('榜单订阅：直接把 MoviePilot 自带榜单（TMDB / 豆瓣）作为订阅入口，'
-                            '勾选来源后即可在插件数据页浏览并一键订阅，无需第三方服务。'),
+                            '默认已启用并内置来源（TMDB 流行趋势），可直接在插件数据页浏览并一键订阅，'
+                            '也可按需增减来源，无需第三方服务。'),
             {
                 'component': 'VRow',
                 'content': [
@@ -850,7 +853,8 @@ class UIConfig:
                             'chips': True,
                             'clearable': True,
                             'closable-chips': True,
-                            'hint': '留空表示不展示任何榜单；来源不可用时插件会优雅降级并给出中文提示，不影响订阅搜索主流程',
+                            'hint': '留空时自动使用默认来源（TMDB 流行趋势），保证启用后即有可用榜单；'
+                                    '来源不可用时插件会优雅降级并给出中文提示，不影响订阅搜索主流程',
                             'persistent-hint': True
                         }
                     }]
@@ -993,9 +997,9 @@ class UIConfig:
             "kdocs_batch_rows": 1000,
             "kdocs_cookie": "",
 
-            # 榜单订阅（v1.9.0）
-            "leaderboard_enabled": False,
-            "leaderboard_sources": [],
+            # 榜单订阅（v1.9.0；v1.9.1 改为「首次使用即可用」：默认启用 + 安全默认来源）
+            "leaderboard_enabled": True,
+            "leaderboard_sources": list(DEFAULT_LEADERBOARD_SOURCES),
             "leaderboard_page_size": 20,
             "leaderboard_cache_minutes": 30,
             "leaderboard_refresh_minutes": 0
@@ -1004,21 +1008,68 @@ class UIConfig:
         return form_schema, default_config
 
     @staticmethod
-    def _leaderboard_card(items: Optional[List[dict]] = None) -> Dict[str, Any]:
-        """数据页「榜单订阅」卡片（v1.9.0）。
+    def _leaderboard_source_label(source_id: Any) -> str:
+        """来源 id -> 中文名（未知 id 原样返回），供数据页展示已配置来源。"""
+        sid = str(source_id or '').strip()
+        if not sid:
+            return ''
+        for item in LEADERBOARD_SOURCES or []:
+            if isinstance(item, dict) and str(item.get('id') or '').strip() == sid:
+                return str(item.get('name') or sid)
+        return sid
 
-        只渲染插件本地快照，**零网络请求**；快照为空时给出中文空状态提示，
-        引导用户去设置页勾选榜单来源。
+    @staticmethod
+    def _leaderboard_state_summary(state: Optional[dict] = None) -> Dict[str, Any]:
+        """把插件传入的榜单状态归一化为展示用结构（v1.9.1）。
+
+        只读取 ``enabled`` / ``source_names`` / ``sources`` 三个非敏感字段：
+        即使调用方误传了 Cookie、Token、访问码等字段，也不会进入渲染结果。
         """
+        state = state if isinstance(state, dict) else {}
+        enabled = bool(state.get('enabled'))
+
+        raw_names = state.get('source_names')
+        names = [str(name).strip() for name in raw_names
+                 if str(name).strip()] if isinstance(raw_names, (list, tuple)) else []
+        if not names:
+            raw_ids = state.get('sources')
+            if isinstance(raw_ids, (list, tuple)):
+                names = [UIConfig._leaderboard_source_label(sid) for sid in raw_ids]
+                names = [name for name in names if name]
+        return {'enabled': enabled, 'source_names': names}
+
+    @staticmethod
+    def _leaderboard_card(items: Optional[List[dict]] = None,
+                          state: Optional[dict] = None) -> Dict[str, Any]:
+        """数据页「榜单订阅」卡片（v1.9.0，v1.9.1 增加状态与初始化入口）。
+
+        只渲染插件本地快照与**非敏感**配置状态，**零网络请求**：
+            * 顶部展示当前启用状态（已启用 / 未启用）；
+            * 展示已配置来源的中文名，未配置时给出可操作提示；
+            * 空快照时按钮变为「初始化榜单」，非空时为「刷新榜单」，
+              两者都指向后台刷新路由（请求线程不同步抓取）。
+        """
+        summary = UIConfig._leaderboard_state_summary(state)
+        enabled = summary['enabled']
+        source_names = summary['source_names']
+        has_items = bool(items)
+
+        source_text = '、'.join(source_names) if source_names else '未配置来源'
         rows: List[Dict[str, Any]] = []
         rendered_count = 0
 
-        if not items:
+        if not has_items:
+            if enabled:
+                empty_text = (f'暂无榜单数据（已启用榜单订阅，来源：{source_text}）：'
+                              '点击下方「初始化榜单」由后台抓取，稍后重新打开本页查看；'
+                              '开启后台刷新后本卡片会自动更新。')
+            else:
+                empty_text = ('暂无榜单数据：当前未启用榜单订阅，请在插件设置页「榜单」页签'
+                              '打开「启用榜单订阅」并保存，再点击下方按钮初始化。')
             rows.append({
                 'component': 'div',
                 'props': {'class': 'text-caption text-medium-emphasis'},
-                'text': '暂无榜单数据：请在插件设置页「榜单」页签勾选榜单来源并保存，'
-                        '再点击下方「刷新榜单」；开启后台刷新后本卡片会自动更新。'
+                'text': empty_text
             })
         else:
             for item in items[:20]:
@@ -1062,6 +1113,21 @@ class UIConfig:
                     ]
                 })
 
+        # 启用状态 + 已配置来源（v1.9.1）：让用户在数据页一眼看清当前配置
+        status_row = {
+            'component': 'div',
+            'props': {'class': 'd-flex flex-wrap align-center ga-2 mb-2'},
+            'content': [
+                {'component': 'VChip',
+                 'props': {'size': 'x-small', 'variant': 'flat',
+                           'color': 'success' if enabled else 'warning'},
+                 'text': '已启用' if enabled else '未启用'},
+                {'component': 'span',
+                 'props': {'class': 'text-caption text-medium-emphasis'},
+                 'text': f'来源：{source_text}'}
+            ]
+        }
+
         body: List[Dict[str, Any]] = [
             {
                 'component': 'div',
@@ -1079,9 +1145,9 @@ class UIConfig:
                             'variant': 'text',
                             'color': 'primary',
                             'prepend-icon': 'mdi-refresh',
-                            'title': '后台刷新榜单快照'
+                            'title': '后台初始化并抓取榜单快照' if not has_items else '后台刷新榜单快照'
                         },
-                        'text': '刷新榜单',
+                        'text': '刷新榜单' if has_items else '初始化榜单',
                         # 官方约定：api 为相对路径（不带斜杠、不带 apikey），
                         # 榜单抓取在后台调度器执行，请求线程不阻塞。
                         'events': {
@@ -1093,6 +1159,7 @@ class UIConfig:
                     }
                 ]
             },
+            status_row,
             *rows,
             {
                 'component': 'div',
@@ -1113,13 +1180,45 @@ class UIConfig:
         }
 
     @staticmethod
+    def _share_link_card() -> Dict[str, Any]:
+        """数据页 115 盘链解析入口：只提交用户输入，不回显访问码。"""
+        return {
+            'component': 'VCard',
+            'props': {'class': 'mt-4', 'variant': 'tonal', 'color': 'secondary', 'rounded': 'lg'},
+            'content': [{
+                'component': 'VCardText',
+                'props': {'class': 'py-3'},
+                'content': [
+                    {'component': 'div', 'props': {'class': 'text-subtitle-2 font-weight-bold mb-2'},
+                     'text': '115盘链解析'},
+                    {'component': 'VTextarea', 'props': {
+                        'model': 'share_link_text', 'label': '115 分享链接或文本', 'rows': 3,
+                        'clearable': True, 'placeholder': '粘贴 115 分享链接或包含链接的文本',
+                        'hint': '如链接需要访问码，请一并粘贴；访问码只用于本次解析，不会在结果中显示。',
+                        'persistent-hint': True}},
+                    {'component': 'VBtn', 'props': {
+                        'class': 'mt-3', 'size': 'small', 'color': 'primary',
+                        'prepend-icon': 'mdi-link-variant', 'title': '解析 115 分享链接'},
+                     'text': '解析链接',
+                     'events': {'click': {'api': 'plugin/P115SubSearch/resolve_share_link',
+                                          'method': 'post', 'params': {'text': 'share_link_text'}}}},
+                    {'component': 'div', 'props': {'class': 'text-caption text-medium-emphasis mt-2'},
+                     'text': '解析结果会显示链接状态、文件数量和是否需要补充访问码；不会回显访问码。'}
+                ]
+            }]
+        }
+
+    @staticmethod
     def get_page(history: List[dict],
-                 leaderboard_snapshot: Optional[List[dict]] = None) -> List[dict]:
+                 leaderboard_snapshot: Optional[List[dict]] = None,
+                 leaderboard_state: Optional[dict] = None) -> List[dict]:
         """
         详情页内容与 1.2.4 无强耦合，保持原样即可
 
         v1.9.0：新增 ``leaderboard_snapshot`` 入参，渲染只读榜单卡片
         （默认 None 时展示空状态，兼容旧调用方）。
+        v1.9.1：新增可选 ``leaderboard_state``（启用状态 / 已配置来源），
+        缺省时卡片退化为「未启用」提示，旧的两参调用方式保持兼容。
         """
         # 你原有的 get_page 很长，这里不做任何改动，继续沿用你现有版本即可。
         # 如果你希望我也按 1.2.4 统一“文案/按钮标题”，你告诉我我再一起改。
@@ -1328,7 +1427,10 @@ class UIConfig:
                 }]
             }
             # v1.9.0：无转存记录时榜单卡片照常展示（与有记录路径返回结构一致）
-            return [stats_header, empty_state, UIConfig._leaderboard_card(leaderboard_snapshot)]
+            # v1.9.1：同步传入启用状态 / 已配置来源
+            return [stats_header, empty_state,
+                    UIConfig._share_link_card(),
+                    UIConfig._leaderboard_card(leaderboard_snapshot, leaderboard_state)]
 
         movie_history = [h for h in sorted_history if h.get("type") == "电影"][:50]
         tv_history = [h for h in sorted_history if h.get("type") != "电影"][:50]
@@ -1451,4 +1553,7 @@ class UIConfig:
         }
 
         # v1.9.0：数据页追加只读榜单卡片（零网络，仅渲染本地快照）
-        return [stats_header, expansion_panels, UIConfig._leaderboard_card(leaderboard_snapshot)]
+        # v1.9.1：同时展示启用状态 / 已配置来源 / 初始化入口
+        return [stats_header, expansion_panels,
+                UIConfig._share_link_card(),
+                UIConfig._leaderboard_card(leaderboard_snapshot, leaderboard_state)]

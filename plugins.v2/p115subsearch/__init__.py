@@ -26,7 +26,7 @@ from app.schemas.types import EventType, MediaType, NotificationType
 
 from .clients import (PanSouClient, P115ClientManager, NullbrClient,
                       KDocsClient, KDocsError, Dian115Client, Dian115Error,
-                      LeaderboardClient, LeaderboardError)
+                      LeaderboardClient, LeaderboardError, resolve_source_ids)
 from .handlers import (SearchHandler, SyncHandler, SubscribeHandler, ApiHandler,
                        CheckinHandler, LeaderboardHandler, ShareLinkHandler)
 from .ui import UIConfig
@@ -138,8 +138,11 @@ class P115SubSearch(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/cloud.png"
     # 插件版本
-    plugin_version = "1.9.0"
-    # 版本历史（v1.9.0）：
+    plugin_version = "1.9.1"
+    # 版本历史（v1.9.1）：
+    #   * 首次使用榜单默认启用 TMDB 流行趋势，并提供数据页初始化入口；
+    #   * 数据页新增 115 盘链解析卡片，复用既有脱敏解析 API。
+    # v1.9.0：
     #   * 新增「榜单」Tab：原生适配 MoviePilot RecommendChain（TMDB / 豆瓣榜单），
     #     支持榜单浏览、媒体条目展示与一键订阅入口；来源为空或异常时优雅降级。
     #   * 新增盘链能力：识别 / 解析用户输入或发送的 115 分享链接并给出明确状态，
@@ -913,13 +916,18 @@ class P115SubSearch(_PluginBase):
             backup = config.get("rss_sites_backup")
             self._rss_sites_backup = list(backup) if isinstance(backup, (list, tuple)) and backup else None
 
-            # 榜单订阅（v1.9.0）：榜单来源为 MoviePilot 推荐链方法名，
-            # 只做浏览与订阅入口；抓取一律走缓存 / 后台刷新，不进搜索热路径
-            self._leaderboard_enabled = bool(config.get("leaderboard_enabled") or False)
-            self._leaderboard_sources = [
-                str(item).strip() for item in (list(config.get("leaderboard_sources") or []))
-                if str(item).strip()
-            ]
+            # 榜单订阅（v1.9.0 / v1.9.1）：榜单来源为 MoviePilot 推荐链方法名，
+            # 只做浏览与订阅入口；抓取一律走缓存 / 后台刷新，不进搜索热路径。
+            # v1.9.1 first-use：从未保存过榜单开关时默认开启；启用但未配置
+            # （或配置项全部无效）来源时回落到安全默认来源（TMDB 流行趋势），
+            # 避免「已启用却没有任何来源」的不可用空白状态。
+            raw_leaderboard_enabled = config.get("leaderboard_enabled")
+            if raw_leaderboard_enabled is None:
+                raw_leaderboard_enabled = True
+            self._leaderboard_enabled = bool(raw_leaderboard_enabled)
+            self._leaderboard_sources = resolve_source_ids(
+                config.get("leaderboard_sources"), enabled=self._leaderboard_enabled
+            )
             try:
                 self._leaderboard_page_size = max(1, min(int(config.get("leaderboard_page_size") or 20), 100))
             except (TypeError, ValueError):
@@ -1911,6 +1919,10 @@ class P115SubSearch(_PluginBase):
         if not self._leaderboard_handler:
             return {"success": False, "message": "榜单功能未初始化，请重启插件后重试",
                     "data": {"scheduled": False}}
+        if not self._leaderboard_enabled:
+            return {"success": False,
+                    "message": "榜单订阅未启用，请先在插件设置页「榜单」页签打开「启用榜单订阅」并保存",
+                    "data": {"scheduled": False}}
         if not self._leaderboard_sources:
             return {"success": False,
                     "message": "尚未勾选榜单来源，请先在「榜单」页签选择来源并保存配置",
@@ -1979,19 +1991,42 @@ class P115SubSearch(_PluginBase):
         except Exception as error:
             logger.debug(f"刷新 115 账户快照失败：{error}")
 
+    def _leaderboard_page_state(self) -> Dict[str, Any]:
+        """数据页榜单卡片所需的**非敏感**状态（v1.9.1）。
+
+        只输出开关、来源 id / 中文名与刷新间隔，零网络、零密钥：
+        访问码、Cookie、Token 等敏感信息绝不进入渲染数据。
+        """
+        sources = list(self._leaderboard_sources or [])
+        names: List[str] = []
+        for source_id in sources:
+            try:
+                name = (self._leaderboard_client.source_name(source_id)
+                        if self._leaderboard_client else source_id)
+            except Exception:  # noqa: BLE001 - 展示名缺失不影响页面渲染
+                name = source_id
+            names.append(str(name or source_id))
+        return {
+            "enabled": bool(self._leaderboard_enabled),
+            "sources": sources,
+            "source_names": names,
+            "refresh_minutes": int(self._leaderboard_refresh_minutes or 0),
+        }
+
     def get_page(self) -> Optional[List[dict]]:
         # v1.8.5：打开设置页时真实刷新一次 115 网盘 / 癫影账户，
         # 页面渲染读的是快照，所以刷新必须在渲染之前完成。
         self._refresh_accounts_on_page_open()
         history = self.get_data('history') or []
         # v1.9.0：榜单页签只读本地快照（零网络），榜单数据由后台刷新服务预热
+        # v1.9.1：额外传入非敏感状态，数据页展示启用状态 / 已配置来源 / 初始化入口
         leaderboard_snapshot = []
         if self._leaderboard_handler:
             try:
                 leaderboard_snapshot = self._leaderboard_handler.snapshot()
             except Exception as error:  # noqa: BLE001
                 logger.debug(f"读取榜单快照失败：{error}")
-        return UIConfig.get_page(history, leaderboard_snapshot)
+        return UIConfig.get_page(history, leaderboard_snapshot, self._leaderboard_page_state())
 
     def _refresh_accounts_on_page_open(self) -> None:
         """打开配置页时刷新账户（静默 + 冷却，失败不影响页面渲染）。

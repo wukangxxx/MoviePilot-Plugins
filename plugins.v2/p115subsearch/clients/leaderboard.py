@@ -61,6 +61,50 @@ LEADERBOARD_SOURCES: List[Dict[str, str]] = [
 
 SOURCE_MAP: Dict[str, Dict[str, str]] = {item["id"]: item for item in LEADERBOARD_SOURCES}
 
+# v1.9.1 first-use 默认来源：
+#   只依赖 MoviePilot 原生推荐链（TMDB），不引入任何第三方服务；
+#   用户未配置来源时至少有一个可浏览的榜单，避免「已启用却空白」的不可用状态。
+DEFAULT_LEADERBOARD_SOURCES: List[str] = ["tmdb_trending"]
+
+
+def default_leaderboard_sources() -> List[str]:
+    """安全默认来源 id 的副本（调用方可安全修改，不会污染常量）。"""
+    return list(DEFAULT_LEADERBOARD_SOURCES)
+
+
+def normalize_source_ids(raw: Any) -> List[str]:
+    """把配置里的来源归一化为**有效** id 列表：过滤未知来源、去重、保持顺序。
+
+    容忍字符串（逗号分隔）/列表/元组/集合；任何其它类型返回空列表，绝不抛异常。
+    """
+    if isinstance(raw, str):
+        candidates = [part.strip() for part in raw.replace("，", ",").split(",")]
+    elif isinstance(raw, (list, tuple, set)):
+        candidates = [str(item).strip() for item in raw]
+    else:
+        return []
+
+    seen = set()
+    result: List[str] = []
+    for source_id in candidates:
+        if source_id and source_id in SOURCE_MAP and source_id not in seen:
+            seen.add(source_id)
+            result.append(source_id)
+    return result
+
+
+def resolve_source_ids(raw: Any, enabled: bool = True) -> List[str]:
+    """归一化用户配置的榜单来源，并在 first-use 场景回落到安全默认来源（v1.9.1）。
+
+    * **启用榜单**但未配置（或配置项全部无效）时，返回
+      :data:`DEFAULT_LEADERBOARD_SOURCES` —— 保证启用即有可用来源；
+    * 榜单关闭时不强塞默认值，尊重用户的空配置（重新启用时仍可回落默认）。
+    """
+    source_ids = normalize_source_ids(raw)
+    if not source_ids and enabled:
+        return default_leaderboard_sources()
+    return source_ids
+
 # 媒体类型归一化词表
 _MOVIE_TOKENS = {"movie", "电影", "film", "mv", "teleplay_movie"}
 _TV_TOKENS = {"tv", "电视剧", "剧集", "teleplay", "series", "动画", "动漫", "综艺"}

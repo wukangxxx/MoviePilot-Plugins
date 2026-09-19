@@ -1,0 +1,316 @@
+# -*- coding: utf-8 -*-
+"""
+P115SubSearch v1.9.0 测试（三）：配置读写对称 / 版本双源同步 / 依赖边界
+
+对齐任务书「历史经验」：
+    * 版本号必须双源同步（package.v2.json + __init__.py plugin_version）；
+    * 新增 typing/import 或模块级注解必须有模块 import guard；
+    * UI/后端改动必须保持配置 read/write 对称：
+      类属性、init_plugin 读取、UI 控件、__update_config 写回 四处齐全；
+    * grep 证明没有 CloudSubscribe import 或旧插件名残留。
+
+本文件为行为 + AST 测试（非源码字符串断言）。
+
+运行：python tests/test_v190_config_symmetry.py
+     或者 pytest tests/test_v190_config_symmetry.py
+"""
+import ast
+import json
+import re
+import sys
+from pathlib import Path
+
+PLUGIN = Path(__file__).resolve().parent.parent
+REPO = PLUGIN.parent.parent
+
+_passed = 0
+_failed = []
+
+
+def check(name, condition, detail=""):
+    global _passed
+    if condition:
+        _passed += 1
+        print(f"  [PASS] {name}")
+    else:
+        _failed.append(f"{name} :: {detail}")
+        print(f"  [FAIL] {name} :: {detail}")
+
+
+def src(rel):
+    return (PLUGIN / rel).read_text(encoding="utf-8")
+
+
+def py_files():
+    return sorted(p for p in PLUGIN.rglob("*.py") if "__pycache__" not in str(p))
+
+
+# v1.9.0 新增的配置键
+NEW_KEYS = [
+    "leaderboard_enabled",
+    "leaderboard_sources",
+    "leaderboard_page_size",
+    "leaderboard_cache_minutes",
+    "leaderboard_refresh_minutes",
+]
+
+
+# ===========================================================================
+# 1. 版本双源同步
+# ===========================================================================
+
+def test_version_dual_source():
+    init_text = src("__init__.py")
+    match = re.search(r'plugin_version\s*=\s*["\']([^"\']+)["\']', init_text)
+    check("1-1 __init__.py 存在 plugin_version", match is not None, "未找到")
+    check("1-2 plugin_version 为 1.9.0", match and match.group(1) == "1.9.0",
+          match.group(1) if match else "?")
+
+    pkg = json.loads((REPO / "package.v2.json").read_text(encoding="utf-8"))
+    entry = pkg.get("P115SubSearch")
+    check("1-3 package.v2.json 存在 P115SubSearch 条目", entry is not None, "缺失")
+    check("1-4 package.v2.json version 为 1.9.0",
+          entry and entry.get("version") == "1.9.0",
+          str(entry.get("version")) if entry else "?")
+    check("1-5 package.v2.json 有 v1.9.0 中文 history",
+          entry and isinstance(entry.get("history"), dict) and "v1.9.0" in entry["history"],
+          str(list((entry or {}).get("history", {}))[:3]))
+    note = (entry or {}).get("history", {}).get("v1.9.0", "")
+    check("1-6 history 文案为中文且非空",
+          bool(note) and any("一" <= ch <= "鿿" for ch in note), note)
+    check("1-7 __init__.py 版本历史含 v1.9.0",
+          "v1.9.0" in init_text, "未找到 v1.9.0 说明")
+
+
+# ===========================================================================
+# 2. 配置四处对称
+# ===========================================================================
+
+def test_config_symmetry_four_places():
+    init_text = src("__init__.py")
+    ui_text = src("ui/config.py")
+    cfg_text = src("core/config.py")
+
+    # 2.1 类属性声明
+    for key in NEW_KEYS:
+        check(f"2-1 类属性 _{key} 声明", f"_{key}" in init_text, "未找到")
+
+    # 2.2 init_plugin 读取（形如 self._leaderboard_enabled = ... config.get("leaderboard_enabled"...)）
+    read_section = init_text.split("def init_plugin", 1)[-1]
+    for key in NEW_KEYS:
+        pattern = re.compile(rf'config\.get\(\s*["\']{key}["\']')
+        check(f"2-2 init_plugin 读取 {key}", bool(pattern.search(read_section)),
+              "init_plugin 中未读取")
+
+    # 2.3 __update_config 写回
+    update_section = init_text.split("def __update_config", 1)[-1]
+    for key in NEW_KEYS:
+        pattern = re.compile(rf'["\']{key}["\']\s*:')
+        check(f"2-3 __update_config 写回 {key}", bool(pattern.search(update_section)),
+              "__update_config 中未写回")
+
+    # 2.4 UI 控件 + default_config 默认值
+    for key in NEW_KEYS:
+        check(f"2-4 UI 表单包含 {key}", key in ui_text, "ui/config.py 中未出现")
+    defaults = ui_text.split("default_config", 1)[-1]
+    for key in NEW_KEYS:
+        pattern = re.compile(rf'["\']{key}["\']\s*:')
+        check(f"2-5 default_config 含 {key}", bool(pattern.search(defaults)),
+              "default_config 中未出现")
+
+    check("2-6 榜单开关默认关闭", re.search(r'["\']leaderboard_enabled["\']\s*:\s*False', defaults)
+          is not None, "默认值不是 False")
+    check("2-7 榜单来源为空列表", re.search(r'["\']leaderboard_sources["\']\s*:\s*\[\]', defaults)
+          is not None, "默认值不是 []")
+
+    # 现有能力不得被删除（配置键仍在）
+    for legacy in ("kdocs_enabled", "pansou_check_enabled", "max_transfer_links",
+                   "dian115_enabled", "only_115", "blocked_sites_only_115"):
+        check(f"2-8 既有配置键保留 {legacy}", legacy in init_text and legacy in ui_text,
+              "缺失")
+
+
+def test_config_readback_roundtrip():
+    """写入的配置必须能被读回（读写对称的行为验证）。"""
+    init_text = src("__init__.py")
+    # 抓取 __update_config 中每个 key 的右值表达式与 init_plugin 的读取表达式是否同名
+    update_section = init_text.split("def __update_config", 1)[-1]
+    read_section = init_text.split("def init_plugin", 1)[-1]
+
+    pairs = {
+        "leaderboard_enabled": ("bool", "bool"),
+        "leaderboard_page_size": ("int", "int"),
+        "leaderboard_cache_minutes": ("int", "int"),
+        "leaderboard_refresh_minutes": ("int", "int"),
+        "leaderboard_sources": ("list", "list"),
+    }
+    for key, (write_kind, read_kind) in pairs.items():
+        w = re.search(rf'["\']{key}["\']\s*:\s*(bool|int|list)\(', update_section)
+        r = re.search(rf'["\']{key}["\']\s*\)\s*or\s*(bool|int|list)\(', read_section)
+        check(f"3-1 {key} 写回类型为 {write_kind}", w and w.group(1) == write_kind,
+              w.group(1) if w else "未匹配")
+        check(f"3-2 {key} 读取类型为 {read_kind}", r and r.group(1) == read_kind,
+              r.group(1) if r else "未匹配")
+
+
+# ===========================================================================
+# 3. 依赖边界 / import guard
+# ===========================================================================
+
+def test_no_cloudsubscribe_import():
+    offenders = []
+    for path in py_files():
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except SyntaxError as exc:
+            offenders.append(f"{path.name}: 语法错误 {exc}")
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if "cloudsubscribe" in alias.name.lower():
+                        offenders.append(f"{path.name}: import {alias.name}")
+            elif isinstance(node, ast.ImportFrom):
+                module = (node.module or "").lower()
+                if "cloudsubscribe" in module:
+                    offenders.append(f"{path.name}: from {node.module} import ...")
+    check("4-1 全插件无 CloudSubscribe import", not offenders, "; ".join(offenders))
+
+    # 旧插件名残留（源码不允许出现 cloudsubscribe 模块引用）
+    leftover = []
+    for path in py_files():
+        if path.name.startswith("test_"):
+            continue
+        text = path.read_text(encoding="utf-8")
+        if re.search(r"\bcloudsubscribe\b", text, re.IGNORECASE):
+            leftover.append(path.name)
+    check("4-2 非测试源码无 cloudsubscribe 名称残留", not leftover, str(leftover))
+
+
+def test_all_python_files_compile():
+    bad = []
+    for path in py_files():
+        try:
+            compile(path.read_text(encoding="utf-8"), str(path), "exec")
+        except SyntaxError as exc:
+            bad.append(f"{path.name}: {exc}")
+        except Exception as exc:  # noqa: BLE001
+            bad.append(f"{path.name}: {type(exc).__name__}: {exc}")
+    check("5-1 全部 .py 文件 compile 通过", not bad, "; ".join(bad))
+
+
+def test_module_level_app_imports_are_guarded():
+    """模块级 app.* 导入必须在 try/except 内（import guard）。"""
+    guarded_rel = ["clients/leaderboard.py", "handlers/leaderboard.py",
+                   "handlers/share_link.py"]
+    for rel in guarded_rel:
+        path = PLUGIN / rel
+        check(f"6-0 {rel} 存在", path.exists(), "文件缺失")
+        if not path.exists():
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        unguarded = []
+        for node in tree.body:  # 只看模块顶层
+            if isinstance(node, ast.ImportFrom) and (node.module or "").startswith("app"):
+                unguarded.append(node.module)
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name.startswith("app"):
+                        unguarded.append(alias.name)
+        check(f"6-1 {rel} 模块级 app.* 导入均有 guard", not unguarded, str(unguarded))
+
+        # 必须暴露可用性标记
+        text = path.read_text(encoding="utf-8")
+        check(f"6-2 {rel} 暴露 *_AVAILABLE 标记", "_AVAILABLE" in text, "未找到")
+
+
+def test_leaderboard_modules_are_pure():
+    """榜单 / 盘链模块不得反向依赖插件内的重模块（保证可离线单测与低耦合）。"""
+    for rel in ("clients/leaderboard.py", "handlers/leaderboard.py"):
+        tree = ast.parse(src(rel))
+        relative = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and (node.level or 0) > 0:
+                relative.append(node.module)
+        check(f"7-{rel} 无相对导入（可独立单测）", not relative, str(relative))
+
+
+def test_api_routes_registered():
+    """新增 API 路由必须注册且带 apikey 校验。"""
+    init_text = src("__init__.py")
+    api_section = init_text.split("def get_api", 1)[-1]
+    for route in ("/leaderboard/browse", "/leaderboard/subscribe", "/resolve_share_link"):
+        check(f"8-1 注册路由 {route}", f'"{route}"' in api_section, "未注册")
+    check("8-2 get_api 中校验 apikey", "verify_apikey" in api_section, "未见校验")
+
+
+def test_service_registration():
+    """后台刷新服务必须在 get_service 中注册（慢源只走后台）。"""
+    init_text = src("__init__.py")
+    service_section = init_text.split("def get_service", 1)[-1]
+    check("9-1 get_service 含榜单后台刷新", "leaderboard" in service_section.lower(),
+          "未注册榜单服务")
+
+
+def test_sync_hot_path_untouched():
+    """榜单抓取不得进入订阅/搜索同步热路径。"""
+    for rel in ("handlers/search.py", "handlers/subscribe.py", "core/services/sync.py"):
+        path = PLUGIN / rel
+        if not path.exists():
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        bad = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and "leaderboard" in (node.module or "").lower():
+                bad.append(node.module)
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    if "leaderboard" in alias.name.lower():
+                        bad.append(alias.name)
+        check(f"10-{rel} 热路径未 import 榜单模块", not bad, str(bad))
+
+
+# ===========================================================================
+# runner
+# ===========================================================================
+
+TESTS = [
+    test_version_dual_source,
+    test_config_symmetry_four_places,
+    test_config_readback_roundtrip,
+    test_no_cloudsubscribe_import,
+    test_all_python_files_compile,
+    test_module_level_app_imports_are_guarded,
+    test_leaderboard_modules_are_pure,
+    test_api_routes_registered,
+    test_service_registration,
+    test_sync_hot_path_untouched,
+]
+
+
+def main():
+    print("=" * 68)
+    print("P115SubSearch v1.9.0 配置对称 / 版本 / 依赖边界测试")
+    print("=" * 68)
+    for fn in TESTS:
+        print()
+        print(f"-- {fn.__name__}")
+        try:
+            fn()
+        except Exception as exc:  # noqa: BLE001
+            _failed.append(f"{fn.__name__} 执行异常 :: {type(exc).__name__}: {exc}")
+            print(f"  [FAIL] {fn.__name__} 执行异常 :: {type(exc).__name__}: {exc}")
+    print()
+    print("=" * 68)
+    print(f"结果：{_passed} 项通过，{len(_failed)} 项失败")
+    print("=" * 68)
+    if _failed:
+        for f in _failed:
+            print(f"  ✗ {f}")
+        return 1
+    print("\n✅ 全部通过")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

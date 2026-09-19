@@ -7,11 +7,15 @@ from .sync import SyncHandler
 from .subscribe import SubscribeHandler
 from .checkin import CheckinHandler
 from .api import ApiHandler
+from .leaderboard import LeaderboardHandler
+from .share_link import ShareLinkHandler
 
 __all__ = [
     "SearchHandler",
     "SyncHandler",
     "SubscribeHandler",
     "CheckinHandler",
-    "ApiHandler"
+    "ApiHandler",
+    "LeaderboardHandler",
+    "ShareLinkHandler"
 ]

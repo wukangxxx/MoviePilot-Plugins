@@ -9,9 +9,31 @@ from app.log import logger
 from app.db import SessionFactory
 from sqlalchemy import text
 
+try:
+    # 榜单来源目录与后端共用同一份定义，避免 UI 与客户端清单漂移（v1.9.0）
+    from ..clients.leaderboard import LEADERBOARD_SOURCES
+except Exception:  # pragma: no cover - 脱离插件包单独加载时退化为空目录
+    LEADERBOARD_SOURCES = []
+
 
 class UIConfig:
     """UI配置管理类"""
+
+    @staticmethod
+    def get_leaderboard_source_options() -> List[Dict[str, Any]]:
+        """
+        获取榜单来源多选项（v1.9.0）
+        :return: [{"title": "TMDB 热门电影", "value": "tmdb_movies"}, ...]
+        """
+        options = []
+        for item in LEADERBOARD_SOURCES or []:
+            if not isinstance(item, dict):
+                continue
+            source_id = str(item.get("id") or "").strip()
+            if not source_id:
+                continue
+            options.append({"title": str(item.get("name") or source_id), "value": source_id})
+        return options
 
     @staticmethod
     def get_subscribe_options() -> List[Dict[str, Any]]:
@@ -332,6 +354,7 @@ class UIConfig:
         """
         subscribe_options = UIConfig.get_subscribe_options()
         site_name_items = UIConfig.get_site_name_options()
+        leaderboard_options = UIConfig.get_leaderboard_source_options()
 
         # ============ 主界面：插件基本功能配置 ============
         basic_rows: List[Dict[str, Any]] = []
@@ -792,6 +815,58 @@ class UIConfig:
             }
         ]
 
+        # ============ Tab 6：榜单（v1.9.0） ============
+        leaderboard_tab: List[Dict[str, Any]] = [
+            UIConfig._alert('榜单订阅：直接把 MoviePilot 自带榜单（TMDB / 豆瓣）作为订阅入口，'
+                            '勾选来源后即可在插件数据页浏览并一键订阅，无需第三方服务。'),
+            {
+                'component': 'VRow',
+                'content': [
+                    {'component': 'VCol', 'props': {'cols': 12, 'md': 3},
+                     'content': [{'component': 'VSwitch', 'props': {'model': 'leaderboard_enabled', 'label': '启用榜单订阅'}}]},
+                    {'component': 'VCol', 'props': {'cols': 12, 'md': 3},
+                     'content': [{'component': 'VTextField', 'props': {'model': 'leaderboard_page_size', 'label': '单页条数', 'type': 'number', 'placeholder': '20',
+                         'hint': '单次抓取最多展示的条目数（1-100）', 'persistent-hint': True, 'clearable': True}}]},
+                    {'component': 'VCol', 'props': {'cols': 12, 'md': 3},
+                     'content': [{'component': 'VTextField', 'props': {'model': 'leaderboard_cache_minutes', 'label': '缓存（分钟）', 'type': 'number', 'placeholder': '30',
+                         'hint': '榜单为慢源，页内读取本地缓存，过期才回源（1-1440）', 'persistent-hint': True, 'clearable': True}}]},
+                    {'component': 'VCol', 'props': {'cols': 12, 'md': 3},
+                     'content': [{'component': 'VTextField', 'props': {'model': 'leaderboard_refresh_minutes', 'label': '后台刷新间隔（分钟）', 'type': 'number', 'placeholder': '0',
+                         'hint': '0 表示不后台刷新；大于 0 时定时预热榜单缓存（最多每天一次）', 'persistent-hint': True, 'clearable': True}}]}
+                ]
+            },
+            {
+                'component': 'VRow',
+                'content': [{
+                    'component': 'VCol',
+                    'props': {'cols': 12},
+                    'content': [{
+                        'component': 'VSelect',
+                        'props': {
+                            'model': 'leaderboard_sources',
+                            'label': '榜单来源（多选，按需勾选）',
+                            'items': leaderboard_options,
+                            'multiple': True,
+                            'chips': True,
+                            'clearable': True,
+                            'closable-chips': True,
+                            'hint': '留空表示不展示任何榜单；来源不可用时插件会优雅降级并给出中文提示，不影响订阅搜索主流程',
+                            'persistent-hint': True
+                        }
+                    }]
+                }]
+            },
+            {
+                'component': 'VRow',
+                'content': [{
+                    'component': 'VCol',
+                    'props': {'cols': 12},
+                    'content': [{'component': 'VAlert', 'props': {'type': 'info', 'variant': 'tonal',
+                        'text': '榜单页面只读本地快照，零网络开销；抓取与订阅均复用 MoviePilot 原生推荐链与订阅链。'}}]
+                }]
+            }
+        ]
+
         # ============ 组装：主界面 + Tab 区 ============
         form_schema = [
             {
@@ -823,7 +898,8 @@ class UIConfig:
                             {'component': 'VTab', 'props': {'value': 'checkin_tab'}, 'text': '签到'},
                             {'component': 'VTab', 'props': {'value': 'pansou_tab'}, 'text': '盘搜'},
                             {'component': 'VTab', 'props': {'value': 'dian115_tab'}, 'text': '癫影'},
-                            {'component': 'VTab', 'props': {'value': 'kdocs_tab'}, 'text': '金山文档'}
+                            {'component': 'VTab', 'props': {'value': 'kdocs_tab'}, 'text': '金山文档'},
+                            {'component': 'VTab', 'props': {'value': 'leaderboard_tab'}, 'text': '榜单'}
                         ]
                     },
                     {
@@ -834,7 +910,8 @@ class UIConfig:
                             UIConfig._tab_item('checkin_tab', checkin_tab),
                             UIConfig._tab_item('pansou_tab', pansou_tab),
                             UIConfig._tab_item('dian115_tab', dian115_tab),
-                            UIConfig._tab_item('kdocs_tab', kdocs_tab)
+                            UIConfig._tab_item('kdocs_tab', kdocs_tab),
+                            UIConfig._tab_item('leaderboard_tab', leaderboard_tab)
                         ]
                     }
                 ]
@@ -914,15 +991,135 @@ class UIConfig:
             "kdocs_doc_urls": "",
             "kdocs_cache_ttl_hours": 6,
             "kdocs_batch_rows": 1000,
-            "kdocs_cookie": ""
+            "kdocs_cookie": "",
+
+            # 榜单订阅（v1.9.0）
+            "leaderboard_enabled": False,
+            "leaderboard_sources": [],
+            "leaderboard_page_size": 20,
+            "leaderboard_cache_minutes": 30,
+            "leaderboard_refresh_minutes": 0
         }
 
         return form_schema, default_config
 
     @staticmethod
-    def get_page(history: List[dict]) -> List[dict]:
+    def _leaderboard_card(items: Optional[List[dict]] = None) -> Dict[str, Any]:
+        """数据页「榜单订阅」卡片（v1.9.0）。
+
+        只渲染插件本地快照，**零网络请求**；快照为空时给出中文空状态提示，
+        引导用户去设置页勾选榜单来源。
+        """
+        rows: List[Dict[str, Any]] = []
+        rendered_count = 0
+
+        if not items:
+            rows.append({
+                'component': 'div',
+                'props': {'class': 'text-caption text-medium-emphasis'},
+                'text': '暂无榜单数据：请在插件设置页「榜单」页签勾选榜单来源并保存，'
+                        '再点击下方「刷新榜单」；开启后台刷新后本卡片会自动更新。'
+            })
+        else:
+            for item in items[:20]:
+                if not isinstance(item, dict):
+                    continue
+                title = str(item.get('title') or '').strip()
+                if not title:
+                    continue
+                rendered_count += 1
+                year = str(item.get('year') or '').strip()
+                type_text = '电影' if str(item.get('media_type') or '') == 'movie' else '剧集'
+                source_name = str(item.get('source_name') or item.get('source') or '榜单').strip()
+                try:
+                    score = float(item.get('vote_average') or 0)
+                except (TypeError, ValueError):
+                    score = 0.0
+
+                meta = [type_text]
+                if year:
+                    meta.append(year)
+                if score > 0:
+                    meta.append(f"{score:.1f} 分")
+
+                rows.append({
+                    'component': 'div',
+                    'props': {'class': 'd-flex justify-space-between align-center py-1'},
+                    'content': [
+                        {
+                            'component': 'div',
+                            'props': {'class': 'd-flex align-center flex-wrap ga-2'},
+                            'content': [
+                                {'component': 'VIcon', 'props': {'size': 'small', 'class': 'text-medium-emphasis'},
+                                 'text': 'mdi-movie-open' if type_text == '电影' else 'mdi-television-classic'},
+                                {'component': 'span', 'props': {'class': 'font-weight-medium'}, 'text': title},
+                                {'component': 'span', 'props': {'class': 'text-caption text-medium-emphasis'},
+                                 'text': ' · '.join(meta)}
+                            ]
+                        },
+                        {'component': 'span', 'props': {'class': 'text-caption text-medium-emphasis'},
+                         'text': source_name}
+                    ]
+                })
+
+        body: List[Dict[str, Any]] = [
+            {
+                'component': 'div',
+                'props': {'class': 'd-flex justify-space-between align-center mb-2'},
+                'content': [
+                    {
+                        'component': 'div',
+                        'props': {'class': 'text-subtitle-2 font-weight-bold'},
+                        'text': f'榜单订阅（{rendered_count} 条）'
+                    },
+                    {
+                        'component': 'VBtn',
+                        'props': {
+                            'size': 'small',
+                            'variant': 'text',
+                            'color': 'primary',
+                            'prepend-icon': 'mdi-refresh',
+                            'title': '后台刷新榜单快照'
+                        },
+                        'text': '刷新榜单',
+                        # 官方约定：api 为相对路径（不带斜杠、不带 apikey），
+                        # 榜单抓取在后台调度器执行，请求线程不阻塞。
+                        'events': {
+                            'click': {
+                                'api': 'plugin/P115SubSearch/leaderboard/refresh',
+                                'method': 'post'
+                            }
+                        }
+                    }
+                ]
+            },
+            *rows,
+            {
+                'component': 'div',
+                'props': {'class': 'text-caption text-medium-emphasis mt-2'},
+                'text': '榜单数据来自 MoviePilot 原生推荐链（TMDB / 豆瓣），'
+                        '本页只读本地快照，不会触发任何网络请求。'
+            }
+        ]
+
+        return {
+            'component': 'VCard',
+            'props': {'class': 'mt-4', 'variant': 'tonal', 'color': 'primary', 'rounded': 'lg'},
+            'content': [{
+                'component': 'VCardText',
+                'props': {'class': 'py-3'},
+                'content': body
+            }]
+        }
+
+    @staticmethod
+    def get_page(history: List[dict],
+                 leaderboard_snapshot: Optional[List[dict]] = None) -> List[dict]:
         """
         详情页内容与 1.2.4 无强耦合，保持原样即可
+
+        v1.9.0：新增 ``leaderboard_snapshot`` 入参，渲染只读榜单卡片
+        （默认 None 时展示空状态，兼容旧调用方）。
         """
         # 你原有的 get_page 很长，这里不做任何改动，继续沿用你现有版本即可。
         # 如果你希望我也按 1.2.4 统一“文案/按钮标题”，你告诉我我再一起改。
@@ -1130,7 +1327,8 @@ class UIConfig:
                     ]
                 }]
             }
-            return [stats_header, empty_state]
+            # v1.9.0：无转存记录时榜单卡片照常展示（与有记录路径返回结构一致）
+            return [stats_header, empty_state, UIConfig._leaderboard_card(leaderboard_snapshot)]
 
         movie_history = [h for h in sorted_history if h.get("type") == "电影"][:50]
         tv_history = [h for h in sorted_history if h.get("type") != "电影"][:50]
@@ -1252,4 +1450,5 @@ class UIConfig:
             ]
         }
 
-        return [stats_header, expansion_panels]
+        # v1.9.0：数据页追加只读榜单卡片（零网络，仅渲染本地快照）
+        return [stats_header, expansion_panels, UIConfig._leaderboard_card(leaderboard_snapshot)]

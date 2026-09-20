@@ -26,7 +26,8 @@ from app.schemas.types import EventType, MediaType, NotificationType
 
 from .clients import (PanSouClient, P115ClientManager, NullbrClient,
                       KDocsClient, KDocsError, Dian115Client, Dian115Error,
-                      LeaderboardClient, LeaderboardError, resolve_source_ids)
+                      LeaderboardClient, LeaderboardError, resolve_source_ids,
+                      PinglianClient)
 from .handlers import (SearchHandler, SyncHandler, SubscribeHandler, ApiHandler,
                        CheckinHandler, LeaderboardHandler, ShareLinkHandler)
 from .ui import UIConfig
@@ -193,6 +194,8 @@ class P115SubSearch(_PluginBase):
     _include_subscribes: List[int] = []
     # 搜索源优先级（按列表顺序），为空时默认 Nullbr > PanSou
     _search_source_order: List[str] = []
+    _pinglian_enabled: bool = False
+    _pinglian_url: str = ""
 
     _nullbr_enabled: bool = False
     _nullbr_appid: str = ""
@@ -873,6 +876,8 @@ class P115SubSearch(_PluginBase):
             self._dian115_auto_unlock = config.get("dian115_auto_unlock", False)
             self._dian115_max_unlock_points = int(config.get("dian115_max_unlock_points", 50) or 50)
             self._dian115_max_points_per_sub = int(config.get("dian115_max_points_per_sub", 20) or 20)
+            self._pinglian_enabled = bool(config.get("pinglian_enabled", False))
+            self._pinglian_url = (config.get("pinglian_url", "") or "").strip()
 
             # 签到配置（v1.8.0）
             self._checkin_enabled = config.get("checkin_enabled", False)
@@ -1027,6 +1032,10 @@ class P115SubSearch(_PluginBase):
                 proxy=proxy
             )
 
+        self._pinglian_client = None
+        if self._pinglian_enabled and self._pinglian_url:
+            self._pinglian_client = PinglianClient(base_url=self._pinglian_url)
+
         if self._nullbr_enabled:
             if not self._nullbr_appid or not self._nullbr_api_key:
                 missing = []
@@ -1172,7 +1181,9 @@ class P115SubSearch(_PluginBase):
             dian115_enabled=self._dian115_enabled,
             dian115_auto_unlock=self._dian115_auto_unlock,
             dian115_max_unlock_points=self._dian115_max_unlock_points,
-            dian115_max_points_per_sub=self._dian115_max_points_per_sub
+            dian115_max_points_per_sub=self._dian115_max_points_per_sub,
+            pinglian_client=self._pinglian_client,
+            pinglian_enabled=self._pinglian_enabled
         )
         # 设置持久化函数，用于保存订阅的历史积分花费
         self._search_handler.set_data_funcs(self.get_data, self.save_data)
@@ -1293,6 +1304,8 @@ class P115SubSearch(_PluginBase):
             "leaderboard_refresh_minutes": int(self._leaderboard_refresh_minutes),
             # 其他配置
             "search_source_order": self._search_source_order,
+            "pinglian_enabled": self._pinglian_enabled,
+            "pinglian_url": self._pinglian_url,
             "subscribe_filter_mode": self._subscribe_filter_mode,
             "exclude_subscribes": self._exclude_subscribes,
             "include_subscribes": self._include_subscribes,

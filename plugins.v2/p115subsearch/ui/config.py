@@ -542,6 +542,16 @@ class UIConfig:
                     }
                 ]
             },
+            # Pinglian 盘链搜索
+            {
+                'component': 'VRow',
+                'content': [
+                    {'component': 'VCol', 'props': {'cols': 12, 'md': 3},
+                     'content': [{'component': 'VSwitch', 'props': {'model': 'pinglian_enabled', 'label': '启用 Pinglian 盘链'}}]},
+                    {'component': 'VCol', 'props': {'cols': 12, 'md': 9},
+                     'content': [{'component': 'VTextField', 'props': {'model': 'pinglian_url', 'label': 'Pinglian 地址', 'placeholder': 'https://example.invalid'}}]}
+                ]
+            },
             # 搜索源优先级
             {
                 'component': 'VRow',
@@ -556,7 +566,8 @@ class UIConfig:
                             'items': [
                                 {'title': '癫影 (Dian115)', 'value': 'dian115'},
                                 {'title': 'PanSou (盘搜)', 'value': 'pansou'},
-                                {'title': 'KDocs (在线文档库)', 'value': 'kdocs'}
+                                {'title': 'KDocs (在线文档库)', 'value': 'kdocs'},
+                                {'title': 'Pinglian (盘链)', 'value': 'pinglian'}
                             ],
                             'multiple': True,
                             'chips': True,
@@ -972,6 +983,8 @@ class UIConfig:
             "pansou_auth_enabled": False,
             "pansou_channels": "QukanMovie",
             "pansou_check_enabled": True,
+            "pinglian_enabled": False,
+            "pinglian_url": "",
 
             # 癫影 Dian115（v1.8.0 / v1.8.1 增自动登录）
             "dian115_enabled": False,

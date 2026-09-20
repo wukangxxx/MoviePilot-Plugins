@@ -35,7 +35,9 @@ class SearchHandler:
         dian115_enabled: bool = False,
         dian115_auto_unlock: bool = False,
         dian115_max_unlock_points: int = 50,
-        dian115_max_points_per_sub: int = 20
+        dian115_max_points_per_sub: int = 20,
+        pinglian_client=None,
+        pinglian_enabled: bool = False
     ):
         """
         初始化搜索处理器
@@ -73,6 +75,8 @@ class SearchHandler:
         self._dian115_auto_unlock = dian115_auto_unlock
         self._dian115_max_unlock_points = dian115_max_unlock_points
         self._dian115_max_points_per_sub = dian115_max_points_per_sub
+        self._pinglian_client = pinglian_client
+        self._pinglian_enabled = pinglian_enabled
         # Dian115 的积分账本独立维护，避免跨渠道互相挤占预算
         self._dian115_spent_points = 0
         self._dian115_sub_spent_points = 0
@@ -112,6 +116,8 @@ class SearchHandler:
         # KDocs
         if self._kdocs_enabled and self._kdocs_client and self._kdocs_client.is_ready:
             available.append("kdocs")
+        if self._pinglian_enabled and self._pinglian_client:
+            available.append("pinglian")
 
         # 应用用户自定义优先级
         if self._search_source_order:
@@ -183,6 +189,8 @@ class SearchHandler:
                 results = self._search_pansou_tv(mediainfo, season)
         elif source == "kdocs":
             results = self._search_kdocs(mediainfo)
+        elif source == "pinglian":
+            results = self._search_pinglian(mediainfo, media_type, season)
         else:
             logger.warning(f"未知的搜索源: {source}")
             return []
@@ -192,6 +200,18 @@ class SearchHandler:
                 if isinstance(item, dict):
                     item.setdefault("_source", source)
         return results or []
+
+    def _search_pinglian(self, mediainfo: MediaInfo, media_type: MediaType, season: Optional[int] = None) -> List[Dict]:
+        if not self._pinglian_client:
+            return []
+        keyword = mediainfo.title
+        if media_type != MediaType.MOVIE and season:
+            keyword = f"{keyword} S{season}"
+        try:
+            return self._pinglian_client.search(keyword)
+        except Exception as exc:
+            logger.warning(f"Pinglian 查询失败，跳过该搜索源: {exc}")
+            return []
 
     def _search_dian115(
         self,

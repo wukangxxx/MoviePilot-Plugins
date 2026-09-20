@@ -12,10 +12,10 @@ class PinglianClient:
         if not self.base_url or not keyword or not keyword.strip():
             return []
         try:
-            response = self.session.get(f"{self.base_url}/api/search", params={"q": keyword.strip(), "limit": min(max(limit, 1), 50)}, timeout=self.timeout)
+            response = self.session.get(f"{self.base_url}/api/search", params={"q": keyword.strip(), "limit": min(max(int(limit), 1), 50)}, timeout=self.timeout)
             response.raise_for_status()
             payload = response.json()
-        except (requests.RequestException, ValueError, TypeError):
+        except (requests.RequestException, ValueError, TypeError, OverflowError):
             return []
         items = payload.get("data", payload) if isinstance(payload, dict) else payload
         if isinstance(items, dict):

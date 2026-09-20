@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "skills": {
+    "@user_5ea84866/kdocs-skill": {
+      "name": "kdocs skill",
+      "zip_url": "https://api.skillhub.cn/api/v1/download?slug=kdocs-skill&namespace=user_5ea84866",
+      "source": "community",
+      "version": "2.5.29",
+      "namespace": {
+        "canonicalName": "@user_5ea84866/kdocs-skill",
+        "displayName": "user_5ea84866",
+        "handle": "user_5ea84866",
+        "publicSlug": "kdocs-skill"
+      },
+      "internalSlug": "kdocs-skill",
+      "publicSlug": "kdocs-skill",
+      "installDir": "/vol4/1000/hermes/workspaces/moviepilot-plugins/upstream-MoviePilot-Plugins/plugins.v2/p115subsearch/skills/@user_5ea84866/kdocs-skill"
+    }
+  }
+}

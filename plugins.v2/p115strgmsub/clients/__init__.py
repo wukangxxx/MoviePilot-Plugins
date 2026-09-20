@@ -14,3 +14,4 @@ __all__ = [
     "HDHiveOpenAPIClient",
     "HDHiveOpenAPIError"
 ]
+from .pinglian import PinglianClient

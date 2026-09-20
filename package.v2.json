@@ -4,11 +4,12 @@
     "release": true,
     "description": "结合MoviePilot订阅功能，自动搜索115网盘资源并转存缺失剧集。",
     "labels": "订阅,115网盘",
-    "version": "1.9.4",
+    "version": "1.9.5",
     "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/cloud.png",
     "author": "mrtian2016",
     "level": 1,
     "history": {
+      "v1.9.5": "修复插件市场安装器按插件 ID 获取源码目录时返回 404。新增 P115SubSearch 对应插件目录。",
       "v1.9.4": "修复 MoviePilot 插件市场远程版本列表因插件 ID 不一致而无法匹配的问题。",
       "v1.9.2": "1. 新增 Pinglian 原生盘链搜索客户端，兼容多种响应结构并对请求失败优雅降级。",
       "v1.5.4": "1. 修复 p115client 0.0.8.5.1.1 已从 PyPI 下架导致依赖安装失败的问题，改为 >=0.0.9.6,<0.0.10；",
